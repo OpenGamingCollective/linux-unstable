@@ -1480,6 +1480,14 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			is_vendor = true;
 	}
 
+	/*
+	 * A vendor collection may be the only application collection on the
+	 * interface, which hidinput_connect() otherwise skips, leaving the
+	 * hotkey usages unmapped. Unpopulated inputs are dropped later.
+	 */
+	if (is_vendor && (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD))
+		hdev->quirks |= HID_QUIRK_HIDINPUT_FORCE;
+
 	ret = asus_worker_create(hdev, drvdata);
 	if (ret) {
 		hid_warn(hdev, "Failed to initialize worker: %d\n", ret);
