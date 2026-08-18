@@ -1,0 +1,88 @@
+name: Sync linux-next -> master (replay from marker)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # every day at 02:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure upstream
+        run: |
+          git remote remove upstream || true
+          git remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+          git fetch upstream --prune
+
+      - name: Replay only commits after marker on top of upstream/master
+        env:
+          # Set this to the hash of your single marker commit.
+          MARKER_COMMIT: "536526d1b587"
+        run: |
+          set -euo pipefail
+
+          git checkout master
+
+          # REQUIRED for cherry-pick commit creation (runner has no identity by default)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          UP_BASE="upstream/master"
+          git show -s --oneline "$UP_BASE" >/dev/null
+          git show -s --oneline "$MARKER_COMMIT" >/dev/null
+
+          # Compute replay list BEFORE resetting.
+          # This lists commits in chronological order (old->new) after MARKER_COMMIT.
+          MY_COMMITS="$(git rev-list --reverse --no-merges "${MARKER_COMMIT}^..master")"
+
+          if [ -z "${MY_COMMITS// }" ]; then
+            echo "No commits to replay after marker."
+            exit 0
+          fi
+
+          echo "Replaying $(echo "$MY_COMMITS" | wc -w) commit(s):"
+          for c in $MY_COMMITS; do
+            echo "  $c  $(git show -s --format=%s "$c")"
+          done
+          echo
+
+          # Reset master to upstream base
+          git reset --hard "$UP_BASE"
+
+          # Cherry-pick each commit; allow-empty prevents failing when the change is already present.
+          for c in $MY_COMMITS; do
+            echo "Cherry-picking: $c  $(git show -s --format=%s "$c")"
+
+            if git cherry-pick -x --allow-empty "$c"; then
+              :
+            else
+              # If we’re left mid-cherry-pick, abort to avoid a broken working state.
+              if [ -f .git/CHERRY_PICK_HEAD ]; then
+                git cherry-pick --abort || true
+              fi
+
+              # Fail on real conflicts (this should be rare with allow-empty, but keep it strict).
+              if git diff --name-only --diff-filter=U | grep -q .; then
+                echo "Real conflict detected while applying $c"
+                git status
+                exit 1
+              fi
+
+              echo "Cherry-pick failed for $c (non-conflict). Failing to avoid corrupting history."
+              git status
+              exit 1
+            fi
+          done
+
+          echo "Done. Pushing updated master."
+          git push --force-with-lease origin master
