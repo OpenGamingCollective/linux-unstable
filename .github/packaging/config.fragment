@@ -1,0 +1,25 @@
+# OGC config overrides for linux-unstable-ogc
+#
+# This fragment is merged on top of the OGC config (base Arch kernel config +
+# OpenGamingCollective/kernel-packages config/*.{set,unset} fragments) using
+# scripts/kconfig/merge_config.sh in the PKGBUILD prepare() step.
+#
+# Add one "CONFIG_X=y" / "CONFIG_X=m" / "# CONFIG_X is not set" line per
+# option you want to override.
+
+# --- Build fixes ------------------------------------------------------------
+# drivers/net/ethernet/cadence/macb_main.c fails to compile in linux-next
+# (implicit declarations of macb_alloc_tieoff/macb_free_tieoff). The Cadence
+# MACB/GEM hardware is an ARM/SoC NIC, never present on x86_64 OGC targets,
+# so disable the driver until the upstream breakage is fixed.
+# MACB_PCI and MACB_USE_HWSTAMP depend on MACB and drop out automatically.
+CONFIG_MACB=n
+
+# --- CI build sanity --------------------------------------------------------
+# The official Arch config builds with full DWARF5 debug info, which needs
+# ~10+ GB of disk and several hours on a 4-vCPU GitHub runner. A released,
+# every-day-use kernel does not need debug symbols (they are not shipped in
+# the packages anyway), so debug info is disabled here.
+# NOTE: this also disables CONFIG_DEBUG_INFO_BTF, which depends on it.
+# Remove these lines if you need a debug build.
+# CONFIG_DEBUG_INFO is not set
