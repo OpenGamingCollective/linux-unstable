@@ -1,0 +1,267 @@
+name: Build & release linux-unstable-ogc
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PKGDIR: /tmp/pkgbuild
+  DISTDIR: /tmp/dist
+  CCACHE_DIR: /ccache
+  CCACHE_MAXSIZE: 4G
+  # Config fragments maintained by the OGC kernel-packages repository.
+  # The base config is extracted from the official Arch `linux-headers`
+  # package (same approach as kernel-packages' own arch.yaml workflow).
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  build:
+    name: Build kernel packages and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/archlinux:base-devel
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Bootstrap Arch Linux build environment
+        run: |
+          set -euxo pipefail
+          # Refresh keyring first to avoid signature failures on stale images
+          pacman -Sy --needed --noconfirm archlinux-keyring
+          pacman -Su --needed --noconfirm
+          # Everything makepkg needs (mirrors the makedepends of the PKGBUILD).
+          # rust + rust-bindgen are needed because the Arch config enables
+          # CONFIG_RUST=y.
+          pacman -S --needed --noconfirm \
+            bc cpio gettext libelf pahole perl python tar xz zstd \
+            gcc clang llvm lld ccache pigz file git github-cli curl \
+            rust rust-bindgen
+          # makepkg refuses to run as root
+          useradd -m build
+          install -d -o build -g build -m 0777 /ccache
+
+      - name: Checkout kernel sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: /ccache
+          key: ccache-kernel-${{ github.sha }}
+          restore-keys: |
+            ccache-kernel-
+
+      - name: Prepare ccache for the build user
+        run: chown -R build:build /ccache && su build -c 'ccache -s' || true
+
+      - name: Compute kernel version
+        id: kernel
+        run: |
+          set -euxo pipefail
+          # Run steps in job containers get HOME=/github/home while
+          # actions/checkout writes its safe.directory entry to /root/.gitconfig,
+          # so git commands here would fail with "dubious ownership".
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          KVER="$(make -s kernelversion)"
+          NEXT="$(cat localversion-next 2>/dev/null || true)"
+          SHA8="$(git rev-parse --short=8 HEAD)"
+          KREL="${KVER}${NEXT}-unstable-ogc-g${SHA8}-1"
+          TAG="v${KVER}${NEXT}-g${SHA8}"
+          echo "kver=${KVER}"       >> "$GITHUB_OUTPUT"
+          echo "next=${NEXT}"       >> "$GITHUB_OUTPUT"
+          echo "sha8=${SHA8}"       >> "$GITHUB_OUTPUT"
+          echo "krel=${KREL}"       >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "Kernel release: ${KREL}"
+          echo "Release tag:    ${TAG}"
+
+      - name: Stage sources and packaging files
+        run: |
+          set -euxo pipefail
+          # Commit marker consumed by the PKGBUILD (same trick as linux-bisector)
+          git rev-parse --short=8 HEAD > .build_commit
+
+          mkdir -p "${PKGDIR}" "${DISTDIR}"
+          cp .github/packaging/PKGBUILD        "${PKGDIR}/PKGBUILD"
+          cp .github/packaging/config.fragment "${PKGDIR}/config.fragment"
+
+          # ------------------------------------------------------------------
+          # Base config: extract the official Arch Linux kernel .config from
+          # the distro's `linux-headers` package (same method as the OGC
+          # kernel-packages arch.yaml workflow).
+          # ------------------------------------------------------------------
+          set -o pipefail
+          CACHE="${PKGDIR}/pkgcache"
+          mkdir -p "$CACHE"
+          pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
+          PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
+          if [ -z "$PKG" ]; then
+            echo "::error::linux-headers package not found in cache"; exit 1
+          fi
+          CFG="$(tar --zstd -tf "$PKG" | grep -E '^usr/lib/modules/[^/]+/build/\.config$' || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel .config not found inside $PKG"; exit 1
+          fi
+          tar --zstd -xOf "$PKG" "$CFG" > "${PKGDIR}/config"
+          test -s "${PKGDIR}/config"
+          rm -rf "$CACHE"
+          head -n 3 "${PKGDIR}/config"
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments from kernel-packages on top.
+          # Semantics replicate OpenGamingCollective/kernel-configurator:
+          #   *.config.set   -> key=value lines: replace or append
+          #   *.config.unset -> bare key lines: turn into "# key is not set"
+          # Applied in the same order as kernel-packages' arch.yaml:
+          #   set:   arch.config.set, ogc.config.set
+          #   unset: arch.config.unset, ogc.config.unset
+          # ------------------------------------------------------------------
+          apply_set() {
+            local cfg="$1" frag="$2" line key value
+            while IFS= read -r line; do
+              line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+              [ -z "$line" ] && continue
+              case "$line" in '#'*) continue ;; esac
+              case "$line" in *=*) ;; *) continue ;; esac
+              key="${line%%=*}"; value="${line#*=}"
+              if grep -q "^${key}=" "$cfg"; then
+                sed -i "s|^${key}=.*|${key}=${value}|" "$cfg"
+              elif grep -q "^# ${key} is not set$" "$cfg"; then
+                sed -i "s|^# ${key} is not set\$|${key}=${value}|" "$cfg"
+              else
+                printf '%s=%s\n' "$key" "$value" >> "$cfg"
+              fi
+            done < "$frag"
+          }
+          apply_unset() {
+            local cfg="$1" frag="$2" line key
+            while IFS= read -r line; do
+              line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+              [ -z "$line" ] && continue
+              case "$line" in '#'*) continue ;; esac
+              key="$line"
+              if grep -q "^${key}=" "$cfg"; then
+                sed -i "s|^${key}=.*|# ${key} is not set|" "$cfg"
+              fi
+            done < "$frag"
+          }
+
+          for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${PKGDIR}/${f}"
+          done
+          apply_set   "${PKGDIR}/config" "${PKGDIR}/arch.config.set"
+          apply_set   "${PKGDIR}/config" "${PKGDIR}/ogc.config.set"
+          apply_unset "${PKGDIR}/config" "${PKGDIR}/arch.config.unset"
+          apply_unset "${PKGDIR}/config" "${PKGDIR}/ogc.config.unset"
+          echo "Config after OGC fragment merge (head):"
+          head -n 3 "${PKGDIR}/config"
+
+          # Source tarball: contents of the repo as ./linux/, without VCS data.
+          # pigz keeps compression fast on the 4-vCPU runners.
+          tar --exclude-vcs -I pigz -cf "${PKGDIR}/linux.tar.gz" \
+              --transform 's|^\./|linux/|' -C "$GITHUB_WORKSPACE" .
+
+          ls -lh "${PKGDIR}"
+          chown -R build:build "${PKGDIR}"
+
+      - name: Build packages with makepkg
+        env:
+          KREL: ${{ steps.kernel.outputs.krel }}
+        run: |
+          set -euxo pipefail
+          cd "${PKGDIR}"
+          runuser -u build -- env HOME=/home/build CCACHE_DIR=/ccache \
+            makepkg -f --noconfirm --noprogressbar
+
+          ls -lh ./*.pkg.tar.zst
+          cp -v ./*.pkg.tar.zst "${DISTDIR}/"
+          # Ship the exact .config used for the build as well
+          cp -v "src/linux/.config" "${DISTDIR}/config-${KREL}"
+
+      - name: Generate checksums
+        run: |
+          set -euxo pipefail
+          cd "${DISTDIR}"
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Clean build tree (free disk before upload)
+        run: rm -rf "${PKGDIR}/src" "${PKGDIR}/pkg" ; df -h /
+
+      - name: Create GitHub release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.kernel.outputs.tag }}
+          KREL: ${{ steps.kernel.outputs.krel }}
+          KVER: ${{ steps.kernel.outputs.kver }}
+          NEXT: ${{ steps.kernel.outputs.next }}
+        run: |
+          set -euxo pipefail
+
+          # Idempotency: if a stale release exists for this tag (e.g. re-run
+          # of the same commit), remove it so this run can recreate it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY"; then
+            echo "Deleting existing release $TAG, will recreate it"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          # In case a tag without a release is left over, drop it too.
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
+
+          NOTES="$(mktemp)"
+          {
+            echo "Automated build of linux-unstable-ogc."
+            echo
+            echo "- Source commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "- Kernel release: ${KREL}"
+            echo "- Upstream version: ${KVER}${NEXT}"
+            echo "- Base config: Arch \`linux-headers\` .config + [OGC kernel-packages fragments](${KERNEL_PACKAGES_RAW}/config)"
+            echo "- Compiler: clang / LLVM=1 (with ccache)"
+            echo
+            echo "### Artifacts"
+            echo
+            echo '- `linux-unstable-ogc` — kernel image and modules'
+            echo '- `linux-unstable-ogc-headers` — headers for building external modules'
+            echo "- \`config-${KREL}\` — the exact kernel .config used for this build"
+            echo '- `SHA256SUMS` — checksums of all artifacts'
+            echo
+            echo "### Install"
+            echo
+            echo '```sh'
+            echo 'sudo pacman -U linux-unstable-ogc-headers-*.pkg.tar.zst linux-unstable-ogc-*.pkg.tar.zst'
+            echo '```'
+            echo
+            echo "> The initramfs is generated automatically on install via the"
+            echo "> mkinitcpio/dracut pacman hooks (package \`pkgbase\` file)."
+          } > "$NOTES"
+
+          cd "${DISTDIR}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "linux-unstable-ogc ${KREL}" \
+            --notes-file "$NOTES" \
+            ./*.pkg.tar.zst SHA256SUMS "config-${KREL}"
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.kernel.outputs.tag }}
+          KREL: ${{ steps.kernel.outputs.krel }}
+        run: |
+          {
+            echo "## linux-unstable-ogc build"
+            echo
+            echo "- Kernel release: \`${KREL}\`"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
