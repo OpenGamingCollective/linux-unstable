@@ -13,22 +13,91 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PKGDIR: /tmp/pkgbuild
-  DISTDIR: /tmp/dist
-  CCACHE_DIR: /ccache
-  CCACHE_MAXSIZE: 10G
   # Config fragments maintained by the OGC kernel-packages repository.
-  # The base config is extracted from the official Arch `linux-headers`
-  # package (same approach as kernel-packages' own arch.yaml workflow).
+  # Distro base configs are extracted from the official distro packages
+  # (Arch: linux-headers, Fedora: kernel-core) — same approach as the
+  # kernel-packages arch.yaml / fedora.yaml workflows.
   KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
 
 jobs:
-  build:
-    name: Build kernel packages and publish release
+  prepare:
+    name: Prepare sources and version
+    runs-on: ubuntu-latest
+    outputs:
+      kver: ${{ steps.kernel.outputs.kver }}
+      next: ${{ steps.kernel.outputs.next }}
+      sha8: ${{ steps.kernel.outputs.sha8 }}
+      krel: ${{ steps.kernel.outputs.krel }}
+      tag: ${{ steps.kernel.outputs.tag }}
+      kbase: ${{ steps.kernel.outputs.kbase }}
+      kverdot: ${{ steps.kernel.outputs.kverdot }}
+    steps:
+      - name: Checkout kernel sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Compute kernel version
+        id: kernel
+        run: |
+          set -euxo pipefail
+          KVER="$(make -s kernelversion)"
+          NEXT="$(cat localversion-next 2>/dev/null || true)"
+          SHA8="$(git rev-parse --short=8 HEAD)"
+          KREL="${KVER}${NEXT}-unstable-ogc-g${SHA8}-1"
+          TAG="v${KVER}${NEXT}-g${SHA8}"
+          # RPM Version: field must not contain hyphens
+          KVERDOT="$(printf '%s%s' "${KVER}" "${NEXT}" | tr '-' '.')"
+          echo "kver=${KVER}"     >> "$GITHUB_OUTPUT"
+          echo "next=${NEXT}"     >> "$GITHUB_OUTPUT"
+          echo "sha8=${SHA8}"     >> "$GITHUB_OUTPUT"
+          echo "krel=${KREL}"     >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+          echo "kbase=${KVER}${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "kverdot=${KVERDOT}"   >> "$GITHUB_OUTPUT"
+          echo "Kernel release: ${KREL}"
+          echo "Release tag:    ${TAG}"
+
+      - name: Stage sources and packaging files
+        run: |
+          set -euxo pipefail
+          # Commit marker consumed by the Arch PKGBUILD (same trick as
+          # linux-bisector). Written before the tarball is created so it is
+          # included in it.
+          git rev-parse --short=8 HEAD > .build_commit
+
+          STAGE="/tmp/stage"
+          mkdir -p "${STAGE}"
+          cp .github/packaging/PKGBUILD             "${STAGE}/PKGBUILD"
+          cp .github/packaging/merge-fragments.sh   "${STAGE}/merge-fragments.sh"
+          cp .github/packaging/config.fragment      "${STAGE}/config.fragment"
+          cp .github/packaging/fedora/kernel.spec   "${STAGE}/kernel.spec"
+
+          # Source tarball: contents of the repo as ./linux/, without VCS data.
+          tar --exclude-vcs -I 'gzip -1' -cf "${STAGE}/linux.tar.gz" \
+              --transform 's|^\./|linux/|' -C "$GITHUB_WORKSPACE" .
+          ls -lh "${STAGE}"
+
+      - name: Upload staged sources
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+          retention-days: 3
+
+  arch:
+    name: Build Arch Linux packages
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 330
     container:
       image: docker.io/archlinux:base-devel
+    env:
+      PKGDIR: /tmp/pkgbuild
+      DISTDIR: /tmp/dist
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ needs.prepare.outputs.krel }}
     steps:
       - name: Show disk space
         run: df -h /
@@ -44,66 +113,39 @@ jobs:
           # CONFIG_RUST=y.
           pacman -S --needed --noconfirm \
             bc cpio gettext libelf pahole perl python tar xz zstd \
-            gcc clang llvm lld ccache pigz file git github-cli curl \
+            gcc clang llvm lld ccache pigz file curl git \
             rust rust-bindgen
           # makepkg refuses to run as root
           useradd -m build
           install -d -o build -g build -m 0777 /ccache
 
-      - name: Checkout kernel sources
-        uses: actions/checkout@v7
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
         with:
-          fetch-depth: 1
+          name: kernel-sources
+          path: /tmp/stage
 
       - name: Restore compiler cache
         uses: actions/cache@v6
         with:
           path: /ccache
-          key: ccache-kernel-${{ github.sha }}
+          key: ccache-arch-${{ github.sha }}
           restore-keys: |
-            ccache-kernel-
+            ccache-arch-
 
       - name: Prepare ccache for the build user
         run: chown -R build:build /ccache && su build -c 'ccache -s' || true
 
-      - name: Compute kernel version
-        id: kernel
+      - name: Assemble Arch kernel config
+        working-directory: /tmp/stage
         run: |
           set -euxo pipefail
-          # Run steps in job containers get HOME=/github/home while
-          # actions/checkout writes its safe.directory entry to /root/.gitconfig,
-          # so git commands here would fail with "dubious ownership".
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          KVER="$(make -s kernelversion)"
-          NEXT="$(cat localversion-next 2>/dev/null || true)"
-          SHA8="$(git rev-parse --short=8 HEAD)"
-          KREL="${KVER}${NEXT}-unstable-ogc-g${SHA8}-1"
-          TAG="v${KVER}${NEXT}-g${SHA8}"
-          echo "kver=${KVER}"       >> "$GITHUB_OUTPUT"
-          echo "next=${NEXT}"       >> "$GITHUB_OUTPUT"
-          echo "sha8=${SHA8}"       >> "$GITHUB_OUTPUT"
-          echo "krel=${KREL}"       >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
-          echo "Kernel release: ${KREL}"
-          echo "Release tag:    ${TAG}"
-
-      - name: Stage sources and packaging files
-        run: |
-          set -euxo pipefail
-          # Commit marker consumed by the PKGBUILD (same trick as linux-bisector)
-          git rev-parse --short=8 HEAD > .build_commit
-
-          mkdir -p "${PKGDIR}" "${DISTDIR}"
-          cp .github/packaging/PKGBUILD        "${PKGDIR}/PKGBUILD"
-          cp .github/packaging/config.fragment "${PKGDIR}/config.fragment"
-
           # ------------------------------------------------------------------
           # Base config: extract the official Arch Linux kernel .config from
           # the distro's `linux-headers` package (same method as the OGC
           # kernel-packages arch.yaml workflow).
           # ------------------------------------------------------------------
-          set -o pipefail
-          CACHE="${PKGDIR}/pkgcache"
+          CACHE="/tmp/pkgcache"
           mkdir -p "$CACHE"
           pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
           PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
@@ -114,71 +156,36 @@ jobs:
           if [ -z "$CFG" ]; then
             echo "::error::kernel .config not found inside $PKG"; exit 1
           fi
-          tar --zstd -xOf "$PKG" "$CFG" > "${PKGDIR}/config"
-          test -s "${PKGDIR}/config"
+          tar --zstd -xOf "$PKG" "$CFG" > config
+          test -s config
           rm -rf "$CACHE"
-          head -n 3 "${PKGDIR}/config"
 
           # ------------------------------------------------------------------
-          # Layer the OGC config fragments from kernel-packages on top.
-          # Semantics replicate OpenGamingCollective/kernel-configurator:
-          #   *.config.set   -> key=value lines: replace or append
-          #   *.config.unset -> bare key lines: turn into "# key is not set"
-          # Applied in the same order as kernel-packages' arch.yaml:
+          # Layer the OGC config fragments from kernel-packages on top, then
+          # the repo-local config.fragment (which wins). Order matches the
+          # kernel-packages arch.yaml / kernel-configurator semantics:
           #   set:   arch.config.set, ogc.config.set
           #   unset: arch.config.unset, ogc.config.unset
           # ------------------------------------------------------------------
-          apply_set() {
-            local cfg="$1" frag="$2" line key value
-            while IFS= read -r line; do
-              line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
-              [ -z "$line" ] && continue
-              case "$line" in '#'*) continue ;; esac
-              case "$line" in *=*) ;; *) continue ;; esac
-              key="${line%%=*}"; value="${line#*=}"
-              if grep -q "^${key}=" "$cfg"; then
-                sed -i "s|^${key}=.*|${key}=${value}|" "$cfg"
-              elif grep -q "^# ${key} is not set$" "$cfg"; then
-                sed -i "s|^# ${key} is not set\$|${key}=${value}|" "$cfg"
-              else
-                printf '%s=%s\n' "$key" "$value" >> "$cfg"
-              fi
-            done < "$frag"
-          }
-          apply_unset() {
-            local cfg="$1" frag="$2" line key
-            while IFS= read -r line; do
-              line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
-              [ -z "$line" ] && continue
-              case "$line" in '#'*) continue ;; esac
-              key="$line"
-              if grep -q "^${key}=" "$cfg"; then
-                sed -i "s|^${key}=.*|# ${key} is not set|" "$cfg"
-              fi
-            done < "$frag"
-          }
-
           for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
-            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${PKGDIR}/${f}"
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
           done
-          apply_set   "${PKGDIR}/config" "${PKGDIR}/arch.config.set"
-          apply_set   "${PKGDIR}/config" "${PKGDIR}/ogc.config.set"
-          apply_unset "${PKGDIR}/config" "${PKGDIR}/arch.config.unset"
-          apply_unset "${PKGDIR}/config" "${PKGDIR}/ogc.config.unset"
-          echo "Config after OGC fragment merge (head):"
-          head -n 3 "${PKGDIR}/config"
+          bash ./merge-fragments.sh config \
+              arch.config.set ogc.config.set \
+              arch.config.unset ogc.config.unset \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
 
-          # Source tarball: contents of the repo as ./linux/, without VCS data.
-          # pigz keeps compression fast on the 4-vCPU runners.
-          tar --exclude-vcs -I pigz -cf "${PKGDIR}/linux.tar.gz" \
-              --transform 's|^\./|linux/|' -C "$GITHUB_WORKSPACE" .
-
-          ls -lh "${PKGDIR}"
+      - name: Stage PKGBUILD directory
+        run: |
+          set -euxo pipefail
+          mkdir -p "${PKGDIR}" "${DISTDIR}"
+          cd /tmp/stage
+          cp PKGBUILD config.fragment linux.tar.gz config "${PKGDIR}/"
           chown -R build:build "${PKGDIR}"
 
       - name: Build packages with makepkg
-        env:
-          KREL: ${{ steps.kernel.outputs.krel }}
         run: |
           set -euxo pipefail
           cd "${PKGDIR}"
@@ -188,31 +195,209 @@ jobs:
           ls -lh ./*.pkg.tar.zst
           cp -v ./*.pkg.tar.zst "${DISTDIR}/"
           # Ship the exact .config used for the build as well
-          cp -v "src/linux/.config" "${DISTDIR}/config-${KREL}"
+          cp -v "src/linux/.config" "${DISTDIR}/config-arch-${KREL}"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf "${PKGDIR}/src" "${PKGDIR}/pkg" ; df -h /
+
+      - name: Upload Arch packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-packages
+          path: /tmp/dist
+          retention-days: 3
+
+  fedora:
+    name: Build Fedora RPM packages
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/library/fedora:43
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ needs.prepare.outputs.krel }}
+      KBASE: ${{ needs.prepare.outputs.kbase }}
+      KVERDOT: ${{ needs.prepare.outputs.kverdot }}
+      SHA8: ${{ needs.prepare.outputs.sha8 }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          dnf -y install dnf5-plugins rpm-build
+          dnf -y install cpio curl findutils tar gzip
+          mkdir -p /ccache
+
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-fedora-${{ github.sha }}
+          restore-keys: |
+            ccache-fedora-
+
+      - name: Assemble Fedora kernel config
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: extract the official Fedora kernel .config from the
+          # distro's `kernel-core` package (same method as the OGC
+          # kernel-packages fedora.yaml workflow).
+          # ------------------------------------------------------------------
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          dnf download --destdir "$CACHE" kernel-core
+          RPM="$(find "$CACHE" -maxdepth 1 -name 'kernel-core-*.rpm' -type f)"
+          if [ -z "$RPM" ]; then
+            echo "::error::kernel-core package not found in cache"; exit 1
+          fi
+          CFG="$(rpm -qlp "$RPM" | grep -E '^/lib/modules/[^/]+/config$' | head -n1 || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel config not found inside $RPM"; exit 1
+          fi
+          rpm2cpio "$RPM" | cpio -i --to-stdout ".${CFG}" > config
+          test -s config
+          rm -rf "$CACHE"
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments on top, then the repo-local
+          # config.fragment (which wins). Order matches the kernel-packages
+          # fedora.yaml / kernel-configurator semantics:
+          #   set:   fedora.config.set, ogc.config.set
+          #   unset: fedora.config.unset, ogc.config.unset
+          # ------------------------------------------------------------------
+          for f in fedora.config.set ogc.config.set fedora.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash ./merge-fragments.sh config \
+              fedora.config.set ogc.config.set \
+              fedora.config.unset ogc.config.unset \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
+
+      - name: Finalize spec and install build dependencies
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # Substitute the CI placeholders (must happen before `dnf builddep`
+          # so RPM can parse Version:/Release:).
+          sed -i \
+            -e "s/@@KBASEVER@@/${KBASE}/" \
+            -e "s/@@KVERDOTTED@@/${KVERDOT}/" \
+            -e "s/@@SHA8@@/${SHA8}/" \
+            kernel.spec
+          grep -n '^Version:\|^Release:\|%define kbasever\|%define sha8' kernel.spec
+          ! grep -q '@@' kernel.spec
+
+          # Installs the toolchain from the spec BuildRequires, including the
+          # distro dwarves/pahole. Run BEFORE the pahole check below so a
+          # source-built pahole is not overwritten by builddep.
+          dnf -y builddep kernel.spec
+
+      - name: Ensure pahole >= 1.31 (sched_ext/BTF)
+        working-directory: /tmp
+        run: |
+          set -euxo pipefail
+          VER="$(pahole --version | tr -d 'v')"
+          MAJ="${VER%%.*}"; MIN="${VER#*.}"; MIN="${MIN%%.*}"
+          echo "Installed pahole: ${VER}"
+          if [ "$MAJ" -lt 1 ] || { [ "$MAJ" -eq 1 ] && [ "$MIN" -lt 31 ]; }; then
+            echo "pahole < 1.31 breaks sched_ext; building dwarves 1.31 from source"
+            dnf -y install cmake make gcc elfutils-devel zlib-devel
+            curl -fsSLO https://fedorapeople.org/~acme/dwarves/dwarves-1.31.tar.xz
+            echo "0a7f255ccacf8cc7f8cd119099eb327179b4b3c67cb015af646af6d0cb03054d  dwarves-1.31.tar.xz" | sha256sum -c
+            tar -xf dwarves-1.31.tar.xz
+            cmake -B dwarves-1.31/build -S dwarves-1.31 \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -D__LIB=lib
+            make -C dwarves-1.31/build -j"$(nproc)" install
+          fi
+          pahole --version
+
+      - name: Build RPMs with rpmbuild
+        working-directory: /tmp
+        run: |
+          set -euxo pipefail
+          TOPDIR=/tmp/rpmbuild
+          mkdir -p "${TOPDIR}"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp /tmp/stage/linux.tar.gz "${TOPDIR}/SOURCES/"
+          cp /tmp/stage/config        "${TOPDIR}/SOURCES/config"
+          cp /tmp/stage/kernel.spec   "${TOPDIR}/SPECS/kernel.spec"
+
+          rpmbuild --define "_topdir ${TOPDIR}" -ba "${TOPDIR}/SPECS/kernel.spec"
+
+          ls -lh "${TOPDIR}"/RPMS/x86_64/
+
+      - name: Collect Fedora artifacts
+        run: |
+          set -euxo pipefail
+          DISTDIR=/tmp/dist
+          mkdir -p "${DISTDIR}"
+          cp -v /tmp/rpmbuild/RPMS/x86_64/*.rpm "${DISTDIR}/"
+          cp -v /tmp/stage/config "${DISTDIR}/config-fedora-${KREL}"
+          ls -lh "${DISTDIR}"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf /tmp/rpmbuild/BUILD /tmp/rpmbuild/BUILDROOT ; df -h /
+
+      - name: Upload Fedora packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: fedora-packages
+          path: /tmp/dist
+          retention-days: 3
+
+  release:
+    name: Create GitHub release
+    needs: [prepare, arch, fedora]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      KREL: ${{ needs.prepare.outputs.krel }}
+      KVER: ${{ needs.prepare.outputs.kver }}
+      NEXT: ${{ needs.prepare.outputs.next }}
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/dist
+          pattern: "*-packages"
+
+      - name: Flatten artifact directory
+        run: |
+          set -euxo pipefail
+          cd /tmp/dist
+          find . -mindepth 2 -maxdepth 2 -type f -exec mv -t . {} +
+          find . -mindepth 1 -type d -delete
+          ls -lh
 
       - name: Generate checksums
         run: |
           set -euxo pipefail
-          cd "${DISTDIR}"
+          cd /tmp/dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-
-      - name: Clean build tree (free disk before upload)
-        run: rm -rf "${PKGDIR}/src" "${PKGDIR}/pkg" ; df -h /
 
       - name: Create GitHub release and upload packages
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.kernel.outputs.tag }}
-          KREL: ${{ steps.kernel.outputs.krel }}
-          KVER: ${{ steps.kernel.outputs.kver }}
-          NEXT: ${{ steps.kernel.outputs.next }}
         run: |
           set -euxo pipefail
 
           # Idempotency: if a stale release exists for this tag (e.g. re-run
           # of the same commit), remove it so this run can recreate it.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY"; then
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
             echo "Deleting existing release $TAG, will recreate it"
             gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
@@ -226,38 +411,55 @@ jobs:
             echo "- Source commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
             echo "- Kernel release: ${KREL}"
             echo "- Upstream version: ${KVER}${NEXT}"
-            echo "- Base config: Arch \`linux-headers\` .config + [OGC kernel-packages fragments](${KERNEL_PACKAGES_RAW}/config)"
+            echo "- Base configs: Arch \`linux-headers\` + Fedora \`kernel-core\`, plus [OGC kernel-packages fragments](${KERNEL_PACKAGES_RAW}/config)"
             echo "- Compiler: clang / LLVM=1 (with ccache)"
             echo
             echo "### Artifacts"
             echo
+            echo "#### Arch Linux"
+            echo
             echo '- `linux-unstable-ogc` — kernel image and modules'
             echo '- `linux-unstable-ogc-headers` — headers for building external modules'
-            echo "- \`config-${KREL}\` — the exact kernel .config used for this build"
+            echo "- \`config-arch-${KREL}\` — the exact .config used for this build"
+            echo
+            echo "#### Fedora"
+            echo
+            echo '- `kernel-unstable-ogc-core` — kernel image (vmlinuz) and core files'
+            echo '- `kernel-unstable-ogc-modules` — kernel modules'
+            echo '- `kernel-unstable-ogc-devel` — headers for building external modules'
+            echo "- \`config-fedora-${KREL}\` — the exact .config used for this build"
+            echo
             echo '- `SHA256SUMS` — checksums of all artifacts'
             echo
             echo "### Install"
+            echo
+            echo "Arch Linux:"
             echo
             echo '```sh'
             echo 'sudo pacman -U linux-unstable-ogc-headers-*.pkg.tar.zst linux-unstable-ogc-*.pkg.tar.zst'
             echo '```'
             echo
-            echo "> The initramfs is generated automatically on install via the"
-            echo "> mkinitcpio/dracut pacman hooks (package \`pkgbase\` file)."
+            echo "Fedora:"
+            echo
+            echo '```sh'
+            echo 'sudo dnf install ./kernel-unstable-ogc-core-*.rpm ./kernel-unstable-ogc-modules-*.rpm'
+            echo '```'
+            echo
+            echo "> The initramfs is generated automatically on install (mkinitcpio hooks"
+            echo "> on Arch, kernel-install/dracut on Fedora)."
           } > "$NOTES"
 
-          cd "${DISTDIR}"
+          cd /tmp/dist
+          # Upload every artifact produced by the distro jobs (package files
+          # plus the config-* files). SHA256SUMS itself is included by ./*.
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "linux-unstable-ogc ${KREL}" \
             --notes-file "$NOTES" \
-            ./*.pkg.tar.zst SHA256SUMS "config-${KREL}"
+            ./*
 
       - name: Summary
-        env:
-          TAG: ${{ steps.kernel.outputs.tag }}
-          KREL: ${{ steps.kernel.outputs.krel }}
         run: |
           {
             echo "## linux-unstable-ogc build"
