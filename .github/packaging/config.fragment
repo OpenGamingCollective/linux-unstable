@@ -9,6 +9,14 @@
 # drivers, Bluetooth, UVC webcams and all OGC handheld drivers (those live in
 # drivers/hid, drivers/platform/x86 — NOT in staging, so STAGING can go).
 
+# --- Kernel identity --------------------------------------------------------
+# Distro base configs carry their own release suffix (Arch "-arch1", Debian
+# "-1-amd64", ...). It must be empty so that uname -r is identical across
+# the Arch/Fedora/Debian packages: <base>-unstable-ogc-g<sha8>-1 (the suffix
+# itself comes from the localversion.10/20 files written by the packaging).
+CONFIG_LOCALVERSION=""
+# CONFIG_LOCALVERSION_AUTO is not set
+
 # --- Build fixes ------------------------------------------------------------
 # drivers/net/ethernet/cadence/macb_main.c fails to compile in linux-next
 # (implicit declarations of macb_alloc_tieoff/macb_free_tieoff). Cadence
