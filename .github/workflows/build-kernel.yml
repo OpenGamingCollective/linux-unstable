@@ -387,7 +387,8 @@ jobs:
             bc bison flex python3 kmod \
             libelf-dev libdw-dev libssl-dev zlib1g-dev \
             dwarves zstd xz-utils \
-            clang llvm lld ccache curl ca-certificates git
+            clang llvm lld ccache curl ca-certificates git \
+            openssl
           # dpkg-buildpackage refuses to run as root
           useradd -m builder
           install -d -o builder -g builder -m 0777 /ccache
@@ -486,7 +487,15 @@ jobs:
           # not exist in this tree; use the ephemeral in-tree key instead.
           scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
           scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
-          scripts/config --set-str MODULE_SIG_KEY ""
+          # CONFIG_MODULE_SIG_KEY points at the Debian signing cert, which
+          # does not exist in this tree. Reset it to the kbuild default
+          # ("certs/signing_key.pem"): an ephemeral self-signed key generated
+          # during the build and trusted by the kernel itself. The Debian
+          # config sets CONFIG_MODULE_SIG_ALL=y, and with an empty key string
+          # scripts/Makefile.modinst resolves sig-key to "./", making
+          # sign-file read a directory as the private key (SSL DECODER error)
+          # on every module.
+          scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
           scripts/config -u DEFAULT_HOSTNAME
           scripts/config --set-str BUILD_SALT "${KREL}"
           echo "-unstable-ogc-g${SHA8}" > localversion.10-pkgname

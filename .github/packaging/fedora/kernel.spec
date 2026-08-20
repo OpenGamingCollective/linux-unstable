@@ -127,8 +127,13 @@ cp %{SOURCE1} .config
 scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
 # CONFIG_MODULE_SIG_KEY points at the Red Hat signing cert in the distro
-# config; build modules unsigned instead (same as the Arch packages).
-scripts/config --set-str MODULE_SIG_KEY ""
+# config, which does not exist in this tree. Reset it to the kbuild default
+# ("certs/signing_key.pem"): an ephemeral self-signed key generated during
+# the build and trusted by the kernel itself. The Fedora config sets
+# CONFIG_MODULE_SIG_ALL=y, and with an empty key string scripts/Makefile.modinst
+# resolves sig-key to "./", making sign-file read a directory as the private
+# key (SSL DECODER error) on every module.
+scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
 
 # Deterministic / distro-agnostic build identity
 scripts/config -u DEFAULT_HOSTNAME
