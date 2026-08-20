@@ -16,7 +16,7 @@ env:
   PKGDIR: /tmp/pkgbuild
   DISTDIR: /tmp/dist
   CCACHE_DIR: /ccache
-  CCACHE_MAXSIZE: 4G
+  CCACHE_MAXSIZE: 10G
   # Config fragments maintained by the OGC kernel-packages repository.
   # The base config is extracted from the official Arch `linux-headers`
   # package (same approach as kernel-packages' own arch.yaml workflow).
@@ -51,12 +51,12 @@ jobs:
           install -d -o build -g build -m 0777 /ccache
 
       - name: Checkout kernel sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /ccache
           key: ccache-kernel-${{ github.sha }}
