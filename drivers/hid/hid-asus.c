@@ -1267,6 +1267,7 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0xa6: asus_map_key_clear(KEY_F16);		break; /* ROG Ally QAM button */
 		case 0xa7: asus_map_key_clear(KEY_F17);		break; /* ROG Ally ROG long-press */
 		case 0xa8: asus_map_key_clear(KEY_F18);		break; /* ROG Ally ROG long-press-release */
+		case 0x9c: asus_map_key_clear(KEY_F19);		break; /* Zephyrus Duo tent mode */
 
 		default:
 			/* ASUS lazily declares 256 usages, ignore the rest,
