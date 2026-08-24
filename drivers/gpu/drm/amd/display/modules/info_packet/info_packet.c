@@ -664,13 +664,25 @@ static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
 		struct dc_info_packet *infopacket)
 {
 	unsigned int field_rate_in_hz;
+	bool vrr_active;
+
+	vrr_active = vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
+		     vrr->state == VRR_STATE_ACTIVE_FIXED;
+
+	/*
+	 * Enables FreeSync-like behavior by keeping HDMI VRR signalling active
+	 * in fixed refresh rate conditions like normal desktop work/web browsing.
+	 * Functionally behaves like non-VRR mode by keeping the actual refresh
+	 * rate fixed.
+	 */
+	if (stream->freesync_on_desktop)
+		vrr_active |= vrr->state == VRR_STATE_INACTIVE;
 
 	/* FVA Factor setting */
 	set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__FVA_FACTOR_M1,
 			(fva_factor > 0) ? (fva_factor - 1) : 0);
 	/* VRR Parameters */
-	if (vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
-	    vrr->state == VRR_STATE_ACTIVE_FIXED) {
+	if (vrr_active) {
 		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__VRR_EN, 1);
 	} else {
 		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__VRR_EN, 0);
@@ -712,8 +724,7 @@ static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
 	 * VTEM with Data_Set_Length = 0 preserves the every-MTW cadence while
 	 * staying compliant (e.g. HDMI GCTS HF1-58 step 6.2).
 	 */
-	if (vrr->state != VRR_STATE_ACTIVE_VARIABLE &&
-	    vrr->state != VRR_STATE_ACTIVE_FIXED && fva_factor == 0)
+	if (!vrr_active && fva_factor == 0)
 		set_field_with_mask(&infopacket->sb[VTEM_PB6],
 				 MASK_VTEM_PB6__DATA_SET_LENGTH_LSB, 0);
 
@@ -814,4 +825,3 @@ void mod_build_adaptive_sync_infopacket_v2(const struct dc_stream_state *stream,
 		info_packet->sb[6] = param->decrease.frame_duration_hex;
 	}
 }
-
