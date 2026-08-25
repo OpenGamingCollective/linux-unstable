@@ -122,3 +122,8 @@ CONFIG_LOCALVERSION=""
 # All OGC handheld drivers live in mainline trees (drivers/hid,
 # drivers/platform/x86), not staging.
 # CONFIG_STAGING is not set
+
+# --- Drivers under review in this repo ---------------------------------------
+# hid-ayaneo (PR #3); mirrors OpenGamingCollective/kernel-packages#35, which
+# lands the option in the real OGC config once the driver merges.
+CONFIG_HID_AYANEO=m

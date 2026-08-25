@@ -664,10 +664,6 @@ static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
 		struct dc_info_packet *infopacket)
 {
 	unsigned int field_rate_in_hz;
-	bool vrr_active;
-
-	vrr_active = vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
-		     vrr->state == VRR_STATE_ACTIVE_FIXED;
 
 	/*
 	 * Enables FreeSync-like behavior by keeping HDMI VRR signalling active
@@ -675,8 +671,10 @@ static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
 	 * Functionally behaves like non-VRR mode by keeping the actual refresh
 	 * rate fixed.
 	 */
-	if (stream->freesync_on_desktop)
-		vrr_active |= vrr->state == VRR_STATE_INACTIVE;
+	const bool vrr_active = vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
+			vrr->state == VRR_STATE_ACTIVE_FIXED ||
+			(stream->freesync_on_desktop &&
+			 vrr->state == VRR_STATE_INACTIVE);
 
 	/* FVA Factor setting */
 	set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__FVA_FACTOR_M1,
@@ -825,3 +823,4 @@ void mod_build_adaptive_sync_infopacket_v2(const struct dc_stream_state *stream,
 		info_packet->sb[6] = param->decrease.frame_duration_hex;
 	}
 }
+
