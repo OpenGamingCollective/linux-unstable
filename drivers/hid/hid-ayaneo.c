@@ -40,6 +40,7 @@
 #include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 
 #define AYA3_REPORT_SIZE	65
 #define AYA3_RESP_SIZE		64
@@ -362,8 +363,13 @@ static int aya3_register_led(struct aya3 *aya)
 	cdev->max_brightness = 255;
 	cdev->brightness_set_blocking = aya3_led_set;
 
-	return devm_led_classdev_multicolor_register(&aya->hdev->dev,
-						     &aya->mcled);
+	/*
+	 * Not devm: the LED must be unregistered before hid_hw_stop() in
+	 * remove, or a concurrent brightness write could reach a torn
+	 * down transport.
+	 */
+	return led_classdev_multicolor_register(&aya->hdev->dev,
+						&aya->mcled);
 }
 
 static const struct dmi_system_id aya3_dmi_table[] = {
@@ -444,6 +450,17 @@ err_stop:
 
 static void aya3_remove(struct hid_device *hdev)
 {
+	struct aya3 *aya = hid_get_drvdata(hdev);
+
+	led_classdev_multicolor_unregister(&aya->mcled);
+	/*
+	 * A brightness store racing with the unregister can requeue
+	 * set_brightness_work after the flush inside
+	 * led_classdev_unregister() runs but before the sysfs node is
+	 * removed. Flush again now that nothing can requeue it, while
+	 * the transport is still up.
+	 */
+	flush_work(&aya->mcled.led_cdev.set_brightness_work);
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }
