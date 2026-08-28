@@ -256,7 +256,7 @@ static int ayaneo_send_config(struct ayaneo *aya, u8 eject)
 }
 
 static int ayaneo_raw_event(struct hid_device *hdev, struct hid_report *report,
-			  u8 *data, int size)
+			    u8 *data, int size)
 {
 	struct ayaneo *aya = hid_get_drvdata(hdev);
 	const struct aya3_resp *resp = (const struct aya3_resp *)data;
@@ -417,7 +417,7 @@ static int ayaneo_led_set(struct led_classdev *cdev, enum led_brightness value)
  * (the firmware always repeats indefinitely).
  */
 static int ayaneo_pattern_set(struct led_classdev *cdev,
-			    struct led_pattern *pattern, u32 len, int repeat)
+			      struct led_pattern *pattern, u32 len, int repeat)
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
 	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
@@ -461,6 +461,7 @@ static int ayaneo_register_led(struct ayaneo *aya)
 				    dev_name(&aya->hdev->dev));
 	if (!cdev->name)
 		return -ENOMEM;
+	cdev->color = LED_COLOR_ID_RGB;
 	cdev->brightness = 0;
 	cdev->max_brightness = 255;
 	cdev->brightness_set_blocking = ayaneo_led_set;
