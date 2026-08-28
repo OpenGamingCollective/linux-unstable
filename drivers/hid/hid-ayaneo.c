@@ -33,6 +33,7 @@
  */
 
 #include <linux/build_bug.h>
+#include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/hid.h>
@@ -282,13 +283,10 @@ static ssize_t ayaneo_module_show(struct device *dev, char *buf, bool right)
 {
 	struct ayaneo *aya = dev_get_drvdata(dev);
 	struct aya3_resp resp;
-	int ret;
+	int ret = 0;
 
-	ret = mutex_lock_interruptible(&aya->lock);
-	if (ret)
-		return ret;
-	ret = ayaneo_check(aya, &resp);
-	mutex_unlock(&aya->lock);
+	scoped_cond_guard(mutex_intr, return -EINTR, &aya->lock)
+		ret = ayaneo_check(aya, &resp);
 	if (ret)
 		return ret;
 
@@ -316,7 +314,7 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	struct ayaneo *aya = dev_get_drvdata(dev);
 	struct aya3_resp resp;
 	u8 eject;
-	int ret, err, i;
+	int ret = 0, err, i;
 
 	if (sysfs_streq(buf, "left"))
 		eject = AYA3_EJECT_LEFT;
@@ -327,36 +325,33 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	else
 		return -EINVAL;
 
-	ret = mutex_lock_interruptible(&aya->lock);
-	if (ret)
-		return ret;
-
-	ret = ayaneo_send_config(aya, eject);
-	if (ret)
-		goto out;
-
-	/*
-	 * Wait for the firmware to report the eject as done. Userspace
-	 * must then cut power through ayaneo-ec's controller_power for
-	 * the module to be physically released.
-	 */
-	ret = -ETIMEDOUT;
-	for (i = 0; i < AYA3_EJECT_POLLS; i++) {
-		msleep(AYA3_EJECT_POLL_MS);
-		err = ayaneo_check(aya, &resp);
-		if (err == -ETIMEDOUT)
-			continue;	/* busy mid-eject, keep polling */
-		if (err) {
-			ret = err;
+	scoped_cond_guard(mutex_intr, return -EINTR, &aya->lock) {
+		ret = ayaneo_send_config(aya, eject);
+		if (ret)
 			break;
-		}
-		if (!(resp.eject_status & ~AYA3_EJECT_DONE_MASK)) {
-			ret = 0;
-			break;
+
+		/*
+		 * Wait for the firmware to report the eject as done.
+		 * Userspace must then cut power through ayaneo-ec's
+		 * controller_power for the module to be physically
+		 * released.
+		 */
+		ret = -ETIMEDOUT;
+		for (i = 0; i < AYA3_EJECT_POLLS; i++) {
+			msleep(AYA3_EJECT_POLL_MS);
+			err = ayaneo_check(aya, &resp);
+			if (err == -ETIMEDOUT)
+				continue;	/* busy mid-eject, keep polling */
+			if (err) {
+				ret = err;
+				break;
+			}
+			if (!(resp.eject_status & ~AYA3_EJECT_DONE_MASK)) {
+				ret = 0;
+				break;
+			}
 		}
 	}
-out:
-	mutex_unlock(&aya->lock);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(eject);
@@ -374,15 +369,13 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 	if (!value)
 		return count;
 
-	ret = mutex_lock_interruptible(&aya->lock);
-	if (ret)
-		return ret;
-	ret = ayaneo_send_config(aya, AYA3_RESET);
-	if (!ret) {
-		msleep(AYA3_RESET_SETTLE_MS);
-		ret = ayaneo_send_config(aya, 0);
+	scoped_cond_guard(mutex_intr, return -EINTR, &aya->lock) {
+		ret = ayaneo_send_config(aya, AYA3_RESET);
+		if (!ret) {
+			msleep(AYA3_RESET_SETTLE_MS);
+			ret = ayaneo_send_config(aya, 0);
+		}
 	}
-	mutex_unlock(&aya->lock);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(reset);
@@ -400,20 +393,19 @@ static int ayaneo_led_set(struct led_classdev *cdev, enum led_brightness value)
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
 	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
-	int ret, i;
+	int ret = 0, i;
 
-	ret = mutex_lock_interruptible(&aya->lock);
-	if (ret)
-		return ret;
+	scoped_cond_guard(mutex_intr, return -EINTR, &aya->lock) {
+		led_mc_calc_color_components(mc, value);
+		for (i = 0; i < 3; i++)
+			aya->rgb[i] = min_t(unsigned int,
+					    aya->subleds[i].brightness, 255);
 
-	led_mc_calc_color_components(mc, value);
-	for (i = 0; i < 3; i++)
-		aya->rgb[i] = min_t(unsigned int, aya->subleds[i].brightness, 255);
-
-	ret = ayaneo_send_config(aya, 0);
-	if (ret)
-		hid_err(aya->hdev, "failed to update RGB config: %d\n", ret);
-	mutex_unlock(&aya->lock);
+		ret = ayaneo_send_config(aya, 0);
+		if (ret)
+			hid_err(aya->hdev,
+				"failed to update RGB config: %d\n", ret);
+	}
 	return ret;
 }
 
@@ -429,17 +421,15 @@ static int ayaneo_pattern_set(struct led_classdev *cdev,
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
 	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
-	int ret;
+	int ret = 0;
 
 	if (len != 2 || pattern[0].brightness || !pattern[1].brightness)
 		return -EINVAL;
 
-	ret = mutex_lock_interruptible(&aya->lock);
-	if (ret)
-		return ret;
-	aya->pulse = true;
-	ret = ayaneo_send_config(aya, 0);
-	mutex_unlock(&aya->lock);
+	scoped_cond_guard(mutex_intr, return -EINTR, &aya->lock) {
+		aya->pulse = true;
+		ret = ayaneo_send_config(aya, 0);
+	}
 	return ret;
 }
 
@@ -447,14 +437,12 @@ static int ayaneo_pattern_clear(struct led_classdev *cdev)
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
 	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
-	int ret;
+	int ret = 0;
 
-	ret = mutex_lock_interruptible(&aya->lock);
-	if (ret)
-		return ret;
-	aya->pulse = false;
-	ret = ayaneo_send_config(aya, 0);
-	mutex_unlock(&aya->lock);
+	scoped_cond_guard(mutex_intr, return -EINTR, &aya->lock) {
+		aya->pulse = false;
+		ret = ayaneo_send_config(aya, 0);
+	}
 	return ret;
 }
 
