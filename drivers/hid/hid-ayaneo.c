@@ -32,6 +32,7 @@
  * Copyright (C) 2026 Matías Martínez <hello@matias.me>
  */
 
+#include <linux/build_bug.h>
 #include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/hid.h>
@@ -65,11 +66,6 @@
 #define AYA3_CMD_CONFIG		0x21
 #define AYA3_SUBCMD_CONFIG	0x09
 
-/* CHECK response fields */
-#define AYA3_RESP_CMD		3
-#define AYA3_RESP_EJECT_STATUS	19
-#define AYA3_RESP_MODULE_LEFT	32
-#define AYA3_RESP_MODULE_RIGHT	33
 /* Bits that stay set in the eject status byte after an eject completes */
 #define AYA3_EJECT_DONE_MASK	0x11
 
@@ -83,7 +79,56 @@
 #define AYA3_RGB_PULSE		0x02
 #define AYA3_RGB_OFF		0xff
 
-#define AYA3_VIBRATION_DEFAULT	0x02	/* medium */
+/* Config command vibration levels, stored in the high nibble */
+enum aya3_vibration {
+	AYA3_VIBRATION_LOW	= 0x1,
+	AYA3_VIBRATION_MEDIUM	= 0x2,
+	AYA3_VIBRATION_HIGH	= 0x3,
+	AYA3_VIBRATION_OFF	= 0x4,
+};
+
+struct aya3_rgb {
+	u8 mode;
+	u8 r;
+	u8 g;
+	u8 b;
+} __packed;
+
+/*
+ * The 65-byte config command. The checksum is the little-endian sum of
+ * bytes 7..64; unk* fields are sent as zero.
+ */
+struct aya3_config {
+	u8 report_id;
+	__le16 csum;
+	u8 cmd;
+	u8 subcmd;
+	u8 unk5[3];
+	struct aya3_rgb right;
+	struct aya3_rgb left;
+	u8 unk16[4];
+	u8 eject;
+	u8 unk21;
+	u8 sensitivity[2];
+	u8 vibration;
+	u8 unk25[7];
+	u8 magic;
+	u8 unk33[32];
+} __packed;
+static_assert(sizeof(struct aya3_config) == AYA3_REPORT_SIZE);
+
+/* Replies echo the subcommand they answer at byte 3 */
+struct aya3_resp {
+	u8 unk0[3];
+	u8 subcmd;
+	u8 unk4[15];
+	u8 eject_status;
+	u8 unk20[12];
+	u8 module_left;
+	u8 module_right;
+	u8 unk34[30];
+} __packed;
+static_assert(sizeof(struct aya3_resp) == AYA3_RESP_SIZE);
 
 struct ayaneo {
 	struct hid_device *hdev;
@@ -92,7 +137,7 @@ struct ayaneo {
 	/* Serializes commands and cached-config access */
 	struct mutex lock;
 	struct completion resp_done;
-	u8 resp[AYA3_RESP_SIZE];
+	struct aya3_resp resp;
 	u8 resp_expect;
 	bool resp_pending;
 
@@ -121,8 +166,7 @@ static int ayaneo_send(struct ayaneo *aya)
 /**
  * ayaneo_cmd() - send the command in aya->xfer and wait for the reply
  * @aya: driver data; @aya->xfer holds the fully built 65-byte command
- * @resp: destination for the AYA3_RESP_SIZE-byte reply, or NULL to
- *        discard it
+ * @resp: destination for the reply, or NULL to discard it
  *
  * The device echoes the subcommand byte of the command it is answering,
  * which ayaneo_raw_event() uses to match replies. Unanswered commands are
@@ -133,7 +177,7 @@ static int ayaneo_send(struct ayaneo *aya)
  * Return: 0 on success, -ETIMEDOUT if every attempt went unanswered, or
  *         a negative errno if sending failed.
  */
-static int ayaneo_cmd(struct ayaneo *aya, u8 *resp)
+static int ayaneo_cmd(struct ayaneo *aya, struct aya3_resp *resp)
 {
 	int attempt, ret;
 
@@ -153,7 +197,7 @@ static int ayaneo_cmd(struct ayaneo *aya, u8 *resp)
 		if (wait_for_completion_timeout(&aya->resp_done,
 						msecs_to_jiffies(AYA3_CMD_TIMEOUT_MS))) {
 			if (resp)
-				memcpy(resp, aya->resp, AYA3_RESP_SIZE);
+				memcpy(resp, &aya->resp, sizeof(*resp));
 			return 0;
 		}
 	}
@@ -171,7 +215,7 @@ static void ayaneo_checksum(u8 *buf)
 	put_unaligned_le16(sum, buf + 1);
 }
 
-static int ayaneo_check(struct ayaneo *aya, u8 *resp)
+static int ayaneo_check(struct ayaneo *aya, struct aya3_resp *resp)
 {
 	memset(aya->xfer, 0, AYA3_REPORT_SIZE);
 	aya->xfer[4] = AYA3_SUBCMD_CHECK;
@@ -186,26 +230,26 @@ static int ayaneo_check(struct ayaneo *aya, u8 *resp)
  */
 static int ayaneo_send_config(struct ayaneo *aya, u8 eject)
 {
-	static const u8 template[AYA3_REPORT_SIZE] = {
-		[3] = AYA3_CMD_CONFIG,
-		[4] = AYA3_SUBCMD_CONFIG,
-		[32] = 0x01,
+	static const struct aya3_config template = {
+		.cmd = AYA3_CMD_CONFIG,
+		.subcmd = AYA3_SUBCMD_CONFIG,
+		.magic = 0x01,
 	};
-	u8 *buf = aya->xfer;
+	struct aya3_config *cfg = (struct aya3_config *)aya->xfer;
 	u8 mode = AYA3_RGB_OFF;
 
 	if (aya->rgb[0] || aya->rgb[1] || aya->rgb[2])
 		mode = aya->pulse ? AYA3_RGB_PULSE : AYA3_RGB_SOLID;
 
-	memcpy(buf, template, AYA3_REPORT_SIZE);
-	/* Right ring, then left ring: mode, R, G, B */
-	buf[8] = mode;
-	memcpy(buf + 9, aya->rgb, 3);
-	buf[12] = mode;
-	memcpy(buf + 13, aya->rgb, 3);
-	buf[20] = eject;
-	buf[24] = aya->vibration << 4;
-	ayaneo_checksum(buf);
+	*cfg = template;
+	cfg->right.mode = mode;
+	cfg->right.r = aya->rgb[0];
+	cfg->right.g = aya->rgb[1];
+	cfg->right.b = aya->rgb[2];
+	cfg->left = cfg->right;
+	cfg->eject = eject;
+	cfg->vibration = aya->vibration << 4;
+	ayaneo_checksum(aya->xfer);
 
 	return ayaneo_cmd(aya, NULL);
 }
@@ -214,6 +258,7 @@ static int ayaneo_raw_event(struct hid_device *hdev, struct hid_report *report,
 			  u8 *data, int size)
 {
 	struct ayaneo *aya = hid_get_drvdata(hdev);
+	const struct aya3_resp *resp = (const struct aya3_resp *)data;
 
 	if (!READ_ONCE(aya->resp_pending) || size < AYA3_RESP_SIZE)
 		return 0;
@@ -224,43 +269,44 @@ static int ayaneo_raw_event(struct hid_device *hdev, struct hid_report *report,
 	 * of the same query milliseconds apart, so this is harmless.
 	 * Replies to a different subcommand are dropped here.
 	 */
-	if (data[AYA3_RESP_CMD] != aya->resp_expect)
+	if (resp->subcmd != aya->resp_expect)
 		return 0;
 
-	memcpy(aya->resp, data, AYA3_RESP_SIZE);
+	memcpy(&aya->resp, data, sizeof(aya->resp));
 	WRITE_ONCE(aya->resp_pending, false);
 	complete(&aya->resp_done);
 	return 0;
 }
 
-static ssize_t ayaneo_module_show(struct device *dev, char *buf, int offset)
+static ssize_t ayaneo_module_show(struct device *dev, char *buf, bool right)
 {
 	struct ayaneo *aya = dev_get_drvdata(dev);
-	u8 resp[AYA3_RESP_SIZE];
+	struct aya3_resp resp;
 	int ret;
 
 	ret = mutex_lock_interruptible(&aya->lock);
 	if (ret)
 		return ret;
-	ret = ayaneo_check(aya, resp);
+	ret = ayaneo_check(aya, &resp);
 	mutex_unlock(&aya->lock);
 	if (ret)
 		return ret;
 
-	return sysfs_emit(buf, "0x%02x\n", resp[offset]);
+	return sysfs_emit(buf, "0x%02x\n",
+			  right ? resp.module_right : resp.module_left);
 }
 
 static ssize_t module_left_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	return ayaneo_module_show(dev, buf, AYA3_RESP_MODULE_LEFT);
+	return ayaneo_module_show(dev, buf, false);
 }
 static DEVICE_ATTR_RO(module_left);
 
 static ssize_t module_right_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
-	return ayaneo_module_show(dev, buf, AYA3_RESP_MODULE_RIGHT);
+	return ayaneo_module_show(dev, buf, true);
 }
 static DEVICE_ATTR_RO(module_right);
 
@@ -268,7 +314,7 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
 	struct ayaneo *aya = dev_get_drvdata(dev);
-	u8 resp[AYA3_RESP_SIZE];
+	struct aya3_resp resp;
 	u8 eject;
 	int ret, err, i;
 
@@ -297,14 +343,14 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	ret = -ETIMEDOUT;
 	for (i = 0; i < AYA3_EJECT_POLLS; i++) {
 		msleep(AYA3_EJECT_POLL_MS);
-		err = ayaneo_check(aya, resp);
+		err = ayaneo_check(aya, &resp);
 		if (err == -ETIMEDOUT)
 			continue;	/* busy mid-eject, keep polling */
 		if (err) {
 			ret = err;
 			break;
 		}
-		if (!(resp[AYA3_RESP_EJECT_STATUS] & ~AYA3_EJECT_DONE_MASK)) {
+		if (!(resp.eject_status & ~AYA3_EJECT_DONE_MASK)) {
 			ret = 0;
 			break;
 		}
@@ -482,7 +528,7 @@ static int ayaneo_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return -ENOMEM;
 
 	aya->hdev = hdev;
-	aya->vibration = AYA3_VIBRATION_DEFAULT;
+	aya->vibration = AYA3_VIBRATION_MEDIUM;
 	init_completion(&aya->resp_done);
 	ret = devm_mutex_init(&hdev->dev, &aya->lock);
 	if (ret)
