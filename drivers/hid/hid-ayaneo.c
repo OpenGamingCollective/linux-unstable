@@ -44,8 +44,21 @@
 
 #define AYA3_REPORT_SIZE	65
 #define AYA3_RESP_SIZE		64
+
+/*
+ * Empirical timings, inherited from the Handheld Daemon
+ * implementation of this protocol and validated on hardware: the
+ * device answers well within 300ms or not at all, needs about half
+ * a second to settle after a reset before it accepts a new
+ * configuration, and completes an eject handshake within a few
+ * seconds (polled below at a rate that keeps the sysfs write
+ * responsive).
+ */
 #define AYA3_CMD_TIMEOUT_MS	300
 #define AYA3_CMD_ATTEMPTS	3
+#define AYA3_RESET_SETTLE_MS	500
+#define AYA3_EJECT_POLL_MS	400
+#define AYA3_EJECT_POLLS	20
 
 /* Subcommands (byte 4); byte 3 is 0x00 except for the config command */
 #define AYA3_SUBCMD_CHECK	0x08
@@ -282,8 +295,8 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	 * the module to be physically released.
 	 */
 	ret = -ETIMEDOUT;
-	for (i = 0; i < 20; i++) {
-		msleep(400);
+	for (i = 0; i < AYA3_EJECT_POLLS; i++) {
+		msleep(AYA3_EJECT_POLL_MS);
 		err = aya3_check(aya, resp);
 		if (err == -ETIMEDOUT)
 			continue;	/* busy mid-eject, keep polling */
@@ -320,7 +333,7 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 		return ret;
 	ret = aya3_send_config(aya, AYA3_RESET);
 	if (!ret) {
-		msleep(500);
+		msleep(AYA3_RESET_SETTLE_MS);
 		ret = aya3_send_config(aya, 0);
 	}
 	mutex_unlock(&aya->lock);
