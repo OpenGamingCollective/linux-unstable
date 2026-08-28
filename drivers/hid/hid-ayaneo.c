@@ -85,7 +85,7 @@
 
 #define AYA3_VIBRATION_DEFAULT	0x02	/* medium */
 
-struct aya3 {
+struct ayaneo {
 	struct hid_device *hdev;
 	/* DMA-safe command buffer; guarded by lock */
 	u8 *xfer;
@@ -104,7 +104,7 @@ struct aya3 {
 	struct mc_subled subleds[3];
 };
 
-static int aya3_send(struct aya3 *aya)
+static int ayaneo_send(struct ayaneo *aya)
 {
 	int ret;
 
@@ -119,13 +119,13 @@ static int aya3_send(struct aya3 *aya)
 }
 
 /**
- * aya3_cmd() - send the command in aya->xfer and wait for the reply
+ * ayaneo_cmd() - send the command in aya->xfer and wait for the reply
  * @aya: driver data; @aya->xfer holds the fully built 65-byte command
  * @resp: destination for the AYA3_RESP_SIZE-byte reply, or NULL to
  *        discard it
  *
  * The device echoes the subcommand byte of the command it is answering,
- * which aya3_raw_event() uses to match replies. Unanswered commands are
+ * which ayaneo_raw_event() uses to match replies. Unanswered commands are
  * retried up to AYA3_CMD_ATTEMPTS times.
  *
  * Context: process context; the caller must hold @aya->lock, which
@@ -133,7 +133,7 @@ static int aya3_send(struct aya3 *aya)
  * Return: 0 on success, -ETIMEDOUT if every attempt went unanswered, or
  *         a negative errno if sending failed.
  */
-static int aya3_cmd(struct aya3 *aya, u8 *resp)
+static int ayaneo_cmd(struct ayaneo *aya, u8 *resp)
 {
 	int attempt, ret;
 
@@ -144,7 +144,7 @@ static int aya3_cmd(struct aya3 *aya, u8 *resp)
 		aya->resp_expect = aya->xfer[4];
 		WRITE_ONCE(aya->resp_pending, true);
 
-		ret = aya3_send(aya);
+		ret = ayaneo_send(aya);
 		if (ret) {
 			WRITE_ONCE(aya->resp_pending, false);
 			return ret;
@@ -161,7 +161,7 @@ static int aya3_cmd(struct aya3 *aya, u8 *resp)
 	return -ETIMEDOUT;
 }
 
-static void aya3_checksum(u8 *buf)
+static void ayaneo_checksum(u8 *buf)
 {
 	u16 sum = 0;
 	int i;
@@ -171,11 +171,11 @@ static void aya3_checksum(u8 *buf)
 	put_unaligned_le16(sum, buf + 1);
 }
 
-static int aya3_check(struct aya3 *aya, u8 *resp)
+static int ayaneo_check(struct ayaneo *aya, u8 *resp)
 {
 	memset(aya->xfer, 0, AYA3_REPORT_SIZE);
 	aya->xfer[4] = AYA3_SUBCMD_CHECK;
-	return aya3_cmd(aya, resp);
+	return ayaneo_cmd(aya, resp);
 }
 
 /*
@@ -184,7 +184,7 @@ static int aya3_check(struct aya3 *aya, u8 *resp)
  * carry joystick sensitivity; those bytes are left zero so the
  * firmware setting is not clobbered on every RGB update.
  */
-static int aya3_send_config(struct aya3 *aya, u8 eject)
+static int ayaneo_send_config(struct ayaneo *aya, u8 eject)
 {
 	static const u8 template[AYA3_REPORT_SIZE] = {
 		[3] = AYA3_CMD_CONFIG,
@@ -205,15 +205,15 @@ static int aya3_send_config(struct aya3 *aya, u8 eject)
 	memcpy(buf + 13, aya->rgb, 3);
 	buf[20] = eject;
 	buf[24] = aya->vibration << 4;
-	aya3_checksum(buf);
+	ayaneo_checksum(buf);
 
-	return aya3_cmd(aya, NULL);
+	return ayaneo_cmd(aya, NULL);
 }
 
-static int aya3_raw_event(struct hid_device *hdev, struct hid_report *report,
+static int ayaneo_raw_event(struct hid_device *hdev, struct hid_report *report,
 			  u8 *data, int size)
 {
-	struct aya3 *aya = hid_get_drvdata(hdev);
+	struct ayaneo *aya = hid_get_drvdata(hdev);
 
 	if (!READ_ONCE(aya->resp_pending) || size < AYA3_RESP_SIZE)
 		return 0;
@@ -233,16 +233,16 @@ static int aya3_raw_event(struct hid_device *hdev, struct hid_report *report,
 	return 0;
 }
 
-static ssize_t aya3_module_show(struct device *dev, char *buf, int offset)
+static ssize_t ayaneo_module_show(struct device *dev, char *buf, int offset)
 {
-	struct aya3 *aya = dev_get_drvdata(dev);
+	struct ayaneo *aya = dev_get_drvdata(dev);
 	u8 resp[AYA3_RESP_SIZE];
 	int ret;
 
 	ret = mutex_lock_interruptible(&aya->lock);
 	if (ret)
 		return ret;
-	ret = aya3_check(aya, resp);
+	ret = ayaneo_check(aya, resp);
 	mutex_unlock(&aya->lock);
 	if (ret)
 		return ret;
@@ -253,21 +253,21 @@ static ssize_t aya3_module_show(struct device *dev, char *buf, int offset)
 static ssize_t module_left_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	return aya3_module_show(dev, buf, AYA3_RESP_MODULE_LEFT);
+	return ayaneo_module_show(dev, buf, AYA3_RESP_MODULE_LEFT);
 }
 static DEVICE_ATTR_RO(module_left);
 
 static ssize_t module_right_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
-	return aya3_module_show(dev, buf, AYA3_RESP_MODULE_RIGHT);
+	return ayaneo_module_show(dev, buf, AYA3_RESP_MODULE_RIGHT);
 }
 static DEVICE_ATTR_RO(module_right);
 
 static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
-	struct aya3 *aya = dev_get_drvdata(dev);
+	struct ayaneo *aya = dev_get_drvdata(dev);
 	u8 resp[AYA3_RESP_SIZE];
 	u8 eject;
 	int ret, err, i;
@@ -285,7 +285,7 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	if (ret)
 		return ret;
 
-	ret = aya3_send_config(aya, eject);
+	ret = ayaneo_send_config(aya, eject);
 	if (ret)
 		goto out;
 
@@ -297,7 +297,7 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	ret = -ETIMEDOUT;
 	for (i = 0; i < AYA3_EJECT_POLLS; i++) {
 		msleep(AYA3_EJECT_POLL_MS);
-		err = aya3_check(aya, resp);
+		err = ayaneo_check(aya, resp);
 		if (err == -ETIMEDOUT)
 			continue;	/* busy mid-eject, keep polling */
 		if (err) {
@@ -318,7 +318,7 @@ static DEVICE_ATTR_WO(eject);
 static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
-	struct aya3 *aya = dev_get_drvdata(dev);
+	struct ayaneo *aya = dev_get_drvdata(dev);
 	bool value;
 	int ret;
 
@@ -331,29 +331,29 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 	ret = mutex_lock_interruptible(&aya->lock);
 	if (ret)
 		return ret;
-	ret = aya3_send_config(aya, AYA3_RESET);
+	ret = ayaneo_send_config(aya, AYA3_RESET);
 	if (!ret) {
 		msleep(AYA3_RESET_SETTLE_MS);
-		ret = aya3_send_config(aya, 0);
+		ret = ayaneo_send_config(aya, 0);
 	}
 	mutex_unlock(&aya->lock);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(reset);
 
-static struct attribute *aya3_attrs[] = {
+static struct attribute *ayaneo_attrs[] = {
 	&dev_attr_module_left.attr,
 	&dev_attr_module_right.attr,
 	&dev_attr_eject.attr,
 	&dev_attr_reset.attr,
 	NULL
 };
-ATTRIBUTE_GROUPS(aya3);
+ATTRIBUTE_GROUPS(ayaneo);
 
-static int aya3_led_set(struct led_classdev *cdev, enum led_brightness value)
+static int ayaneo_led_set(struct led_classdev *cdev, enum led_brightness value)
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
-	struct aya3 *aya = container_of(mc, struct aya3, mcled);
+	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
 	int ret, i;
 
 	ret = mutex_lock_interruptible(&aya->lock);
@@ -364,7 +364,7 @@ static int aya3_led_set(struct led_classdev *cdev, enum led_brightness value)
 	for (i = 0; i < 3; i++)
 		aya->rgb[i] = min_t(unsigned int, aya->subleds[i].brightness, 255);
 
-	ret = aya3_send_config(aya, 0);
+	ret = ayaneo_send_config(aya, 0);
 	if (ret)
 		hid_err(aya->hdev, "failed to update RGB config: %d\n", ret);
 	mutex_unlock(&aya->lock);
@@ -378,11 +378,11 @@ static int aya3_led_set(struct led_classdev *cdev, enum led_brightness value)
  * delta_t values and the repeat count are accepted but not tunable
  * (the firmware always repeats indefinitely).
  */
-static int aya3_pattern_set(struct led_classdev *cdev,
+static int ayaneo_pattern_set(struct led_classdev *cdev,
 			    struct led_pattern *pattern, u32 len, int repeat)
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
-	struct aya3 *aya = container_of(mc, struct aya3, mcled);
+	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
 	int ret;
 
 	if (len != 2 || pattern[0].brightness || !pattern[1].brightness)
@@ -392,27 +392,27 @@ static int aya3_pattern_set(struct led_classdev *cdev,
 	if (ret)
 		return ret;
 	aya->pulse = true;
-	ret = aya3_send_config(aya, 0);
+	ret = ayaneo_send_config(aya, 0);
 	mutex_unlock(&aya->lock);
 	return ret;
 }
 
-static int aya3_pattern_clear(struct led_classdev *cdev)
+static int ayaneo_pattern_clear(struct led_classdev *cdev)
 {
 	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
-	struct aya3 *aya = container_of(mc, struct aya3, mcled);
+	struct ayaneo *aya = container_of(mc, struct ayaneo, mcled);
 	int ret;
 
 	ret = mutex_lock_interruptible(&aya->lock);
 	if (ret)
 		return ret;
 	aya->pulse = false;
-	ret = aya3_send_config(aya, 0);
+	ret = ayaneo_send_config(aya, 0);
 	mutex_unlock(&aya->lock);
 	return ret;
 }
 
-static int aya3_register_led(struct aya3 *aya)
+static int ayaneo_register_led(struct ayaneo *aya)
 {
 	struct led_classdev *cdev = &aya->mcled.led_cdev;
 
@@ -429,9 +429,9 @@ static int aya3_register_led(struct aya3 *aya)
 		return -ENOMEM;
 	cdev->brightness = 0;
 	cdev->max_brightness = 255;
-	cdev->brightness_set_blocking = aya3_led_set;
-	cdev->pattern_set = aya3_pattern_set;
-	cdev->pattern_clear = aya3_pattern_clear;
+	cdev->brightness_set_blocking = ayaneo_led_set;
+	cdev->pattern_set = ayaneo_pattern_set;
+	cdev->pattern_clear = ayaneo_pattern_clear;
 
 	/*
 	 * Not devm: the LED must be unregistered before hid_hw_stop() in
@@ -442,7 +442,7 @@ static int aya3_register_led(struct aya3 *aya)
 						&aya->mcled);
 }
 
-static const struct dmi_system_id aya3_dmi_table[] = {
+static const struct dmi_system_id ayaneo_dmi_table[] = {
 	{
 		.matches = {
 			DMI_MATCH(DMI_BOARD_VENDOR, "AYANEO"),
@@ -452,13 +452,13 @@ static const struct dmi_system_id aya3_dmi_table[] = {
 	{}
 };
 
-static int aya3_probe(struct hid_device *hdev, const struct hid_device_id *id)
+static int ayaneo_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
-	struct aya3 *aya;
+	struct ayaneo *aya;
 	int ret;
 
 	/* The VID/PID is a generic SigmaMicro ID; bind on AYANEO 3 only */
-	if (!dmi_check_system(aya3_dmi_table))
+	if (!dmi_check_system(ayaneo_dmi_table))
 		return -ENODEV;
 
 	if (!hid_is_usb(hdev))
@@ -501,12 +501,12 @@ static int aya3_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	hid_device_io_start(hdev);
 
 	scoped_guard(mutex, &aya->lock)
-		ret = aya3_check(aya, NULL);
+		ret = ayaneo_check(aya, NULL);
 	if (ret)
 		hid_warn(hdev, "controller did not answer status check: %d\n",
 			 ret);
 
-	ret = aya3_register_led(aya);
+	ret = ayaneo_register_led(aya);
 	if (ret)
 		goto err_close;
 
@@ -519,9 +519,9 @@ err_stop:
 	return ret;
 }
 
-static void aya3_remove(struct hid_device *hdev)
+static void ayaneo_remove(struct hid_device *hdev)
 {
-	struct aya3 *aya = hid_get_drvdata(hdev);
+	struct ayaneo *aya = hid_get_drvdata(hdev);
 
 	led_classdev_multicolor_unregister(&aya->mcled);
 	/*
@@ -536,23 +536,23 @@ static void aya3_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 }
 
-static const struct hid_device_id aya3_devices[] = {
+static const struct hid_device_id ayaneo_devices[] = {
 	{ HID_USB_DEVICE(0x1c4f, 0x0002) },
 	{}
 };
-MODULE_DEVICE_TABLE(hid, aya3_devices);
+MODULE_DEVICE_TABLE(hid, ayaneo_devices);
 
-static struct hid_driver aya3_driver = {
+static struct hid_driver ayaneo_driver = {
 	.name = "hid-ayaneo",
-	.id_table = aya3_devices,
-	.probe = aya3_probe,
-	.remove = aya3_remove,
-	.raw_event = aya3_raw_event,
+	.id_table = ayaneo_devices,
+	.probe = ayaneo_probe,
+	.remove = ayaneo_remove,
+	.raw_event = ayaneo_raw_event,
 	.driver = {
-		.dev_groups = aya3_groups,
+		.dev_groups = ayaneo_groups,
 	},
 };
-module_hid_driver(aya3_driver);
+module_hid_driver(ayaneo_driver);
 
 MODULE_AUTHOR("Matías Martínez <hello@matias.me>");
 MODULE_DESCRIPTION("AYANEO 3 detachable controller driver");
