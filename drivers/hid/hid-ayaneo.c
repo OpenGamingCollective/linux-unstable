@@ -67,6 +67,7 @@
 
 /* Config command RGB modes */
 #define AYA3_RGB_SOLID		0x01
+#define AYA3_RGB_PULSE		0x02
 #define AYA3_RGB_OFF		0xff
 
 #define AYA3_VIBRATION_DEFAULT	0x02	/* medium */
@@ -83,6 +84,7 @@ struct aya3 {
 	bool resp_pending;
 
 	u8 rgb[3];
+	bool pulse;
 	u8 vibration;
 
 	struct led_classdev_mc mcled;
@@ -165,22 +167,22 @@ static int aya3_check(struct aya3 *aya, u8 *resp)
 
 /*
  * The config command sets everything at once: RGB for both rings,
- * vibration strength, joystick sensitivity, and the eject/reset field.
+ * vibration strength and the eject/reset field. The command can also
+ * carry joystick sensitivity; those bytes are left zero so the
+ * firmware setting is not clobbered on every RGB update.
  */
 static int aya3_send_config(struct aya3 *aya, u8 eject)
 {
 	static const u8 template[AYA3_REPORT_SIZE] = {
 		[3] = AYA3_CMD_CONFIG,
 		[4] = AYA3_SUBCMD_CONFIG,
-		[22] = 0x33,
-		[23] = 0x22,	/* joystick sensitivity 100%/100% */
 		[32] = 0x01,
-		[37] = 0x64,
-		[38] = 0x64,
 	};
 	u8 *buf = aya->xfer;
-	u8 mode = (aya->rgb[0] || aya->rgb[1] || aya->rgb[2]) ?
-		  AYA3_RGB_SOLID : AYA3_RGB_OFF;
+	u8 mode = AYA3_RGB_OFF;
+
+	if (aya->rgb[0] || aya->rgb[1] || aya->rgb[2])
+		mode = aya->pulse ? AYA3_RGB_PULSE : AYA3_RGB_SOLID;
 
 	memcpy(buf, template, AYA3_REPORT_SIZE);
 	/* Right ring, then left ring: mode, R, G, B */
@@ -202,6 +204,13 @@ static int aya3_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 	if (!READ_ONCE(aya->resp_pending) || size < AYA3_RESP_SIZE)
 		return 0;
+	/*
+	 * Replies carry no sequence number, only the subcommand echo. A
+	 * late reply to a timed-out command can thus complete a newer
+	 * command with the same subcommand; such replies are snapshots
+	 * of the same query milliseconds apart, so this is harmless.
+	 * Replies to a different subcommand are dropped here.
+	 */
 	if (data[AYA3_RESP_CMD] != aya->resp_expect)
 		return 0;
 
@@ -248,7 +257,7 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	struct aya3 *aya = dev_get_drvdata(dev);
 	u8 resp[AYA3_RESP_SIZE];
 	u8 eject;
-	int ret, i;
+	int ret, err, i;
 
 	if (sysfs_streq(buf, "left"))
 		eject = AYA3_EJECT_LEFT;
@@ -275,8 +284,13 @@ static ssize_t eject_store(struct device *dev, struct device_attribute *attr,
 	ret = -ETIMEDOUT;
 	for (i = 0; i < 20; i++) {
 		msleep(400);
-		if (aya3_check(aya, resp))
-			continue;
+		err = aya3_check(aya, resp);
+		if (err == -ETIMEDOUT)
+			continue;	/* busy mid-eject, keep polling */
+		if (err) {
+			ret = err;
+			break;
+		}
 		if (!(resp[AYA3_RESP_EJECT_STATUS] & ~AYA3_EJECT_DONE_MASK)) {
 			ret = 0;
 			break;
@@ -344,6 +358,47 @@ static int aya3_led_set(struct led_classdev *cdev, enum led_brightness value)
 	return ret;
 }
 
+/*
+ * The firmware offers one fixed breathing pattern, pulsing the current
+ * colour at a period it controls. Expose it through the hw_pattern
+ * trigger ABI as the two-step pattern "0 <t> <brightness> <t>"; the
+ * delta_t values and the repeat count are accepted but not tunable
+ * (the firmware always repeats indefinitely).
+ */
+static int aya3_pattern_set(struct led_classdev *cdev,
+			    struct led_pattern *pattern, u32 len, int repeat)
+{
+	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
+	struct aya3 *aya = container_of(mc, struct aya3, mcled);
+	int ret;
+
+	if (len != 2 || pattern[0].brightness || !pattern[1].brightness)
+		return -EINVAL;
+
+	ret = mutex_lock_interruptible(&aya->lock);
+	if (ret)
+		return ret;
+	aya->pulse = true;
+	ret = aya3_send_config(aya, 0);
+	mutex_unlock(&aya->lock);
+	return ret;
+}
+
+static int aya3_pattern_clear(struct led_classdev *cdev)
+{
+	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
+	struct aya3 *aya = container_of(mc, struct aya3, mcled);
+	int ret;
+
+	ret = mutex_lock_interruptible(&aya->lock);
+	if (ret)
+		return ret;
+	aya->pulse = false;
+	ret = aya3_send_config(aya, 0);
+	mutex_unlock(&aya->lock);
+	return ret;
+}
+
 static int aya3_register_led(struct aya3 *aya)
 {
 	struct led_classdev *cdev = &aya->mcled.led_cdev;
@@ -362,6 +417,8 @@ static int aya3_register_led(struct aya3 *aya)
 	cdev->brightness = 0;
 	cdev->max_brightness = 255;
 	cdev->brightness_set_blocking = aya3_led_set;
+	cdev->pattern_set = aya3_pattern_set;
+	cdev->pattern_clear = aya3_pattern_clear;
 
 	/*
 	 * Not devm: the LED must be unregistered before hid_hw_stop() in
@@ -399,7 +456,8 @@ static int aya3_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 
 	/* Bind only the vendor interface, not the gamepad/keyboard ones */
-	if (hdev->collection->usage != (HID_UP_MSVENDOR | 0x0001))
+	if (!hdev->maxcollection ||
+	    hdev->collection->usage != (HID_UP_MSVENDOR | 0x0001))
 		return -ENODEV;
 
 	aya = devm_kzalloc(&hdev->dev, sizeof(*aya), GFP_KERNEL);
