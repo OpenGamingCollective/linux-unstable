@@ -1,0 +1,124 @@
+# OGC config overrides for linux-unstable-ogc
+#
+# This fragment is merged LAST, on top of the OGC config (Arch linux-headers
+# base + OpenGamingCollective/kernel-packages config/*.{set,unset} fragments)
+# via scripts/kconfig/merge_config.sh + olddefconfig in the PKGBUILD.
+#
+# Target hardware: modern gaming desktops and handhelds (Steam Deck, ROG Ally,
+# Legion Go, MSI Claw, GPD, Ayaneo, OneXPlayer...). Keep IMU/gyro/accel/IIO
+# drivers, Bluetooth, UVC webcams and all OGC handheld drivers (those live in
+# drivers/hid, drivers/platform/x86 — NOT in staging, so STAGING can go).
+
+# --- Kernel identity --------------------------------------------------------
+# Distro base configs carry their own release suffix (Arch "-arch1", Debian
+# "-1-amd64", ...). It must be empty so that uname -r is identical across
+# the Arch/Fedora/Debian packages: <base>-unstable-ogc-g<sha8>-1 (the suffix
+# itself comes from the localversion.10/20 files written by the packaging).
+CONFIG_LOCALVERSION=""
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# --- Build fixes ------------------------------------------------------------
+# drivers/net/ethernet/cadence/macb_main.c fails to compile in linux-next
+# (implicit declarations of macb_alloc_tieoff/macb_free_tieoff). Cadence
+# MACB/GEM is an ARM SoC NIC, never present on x86_64 gaming hardware.
+# MACB_PCI and MACB_USE_HWSTAMP depend on MACB and drop out automatically.
+# CONFIG_MACB is not set
+
+# --- Build speed ------------------------------------------------------------
+# Keep DEBUG_INFO/DEBUG_INFO_BTF=y (OGC requires them for BPF/sched_ext) but
+# skip running pahole on every module (thousands of invocations saved).
+# CONFIG_DEBUG_INFO_BTF_MODULES is not set
+
+# --- Xen guest support (not running inside a Xen VM) ------------------------
+# CONFIG_XEN is not set
+
+# --- Ancient graphics / buses ------------------------------------------------
+# AGP is a pre-PCIe bus; radeon covers pre-GCN AMD GPUs (12+ years old).
+# CONFIG_AGP is not set
+# CONFIG_DRM_RADEON is not set
+# PCMCIA/CardBus slots (2000s laptops)
+# CONFIG_PCCARD is not set
+# FireWire (IEEE 1394) ports
+# CONFIG_FIREWIRE is not set
+# Parallel port (printers/scanners from the 90s)
+# CONFIG_PARPORT is not set
+# IndustryPack carrier boards
+# CONFIG_IPACK_BUS is not set
+# 1-Wire bus
+# CONFIG_W1 is not set
+# Analog gameport joysticks (pre-USB)
+# CONFIG_GAMEPORT is not set
+# Floppy disk controller
+# CONFIG_BLK_DEV_FD is not set
+# Server BMC management
+# CONFIG_IPMI_HANDLER is not set
+
+# --- Enterprise / datacenter storage ----------------------------------------
+# Fibre Channel HBAs and enterprise RAID controllers
+# CONFIG_SCSI_LPFC is not set
+# CONFIG_SCSI_QLA_FC is not set
+# CONFIG_QEDF is not set
+# CONFIG_FCOE is not set
+# CONFIG_LIBFC is not set
+# CONFIG_MEGARAID_SAS is not set
+# CONFIG_MEGARAID_LEGACY is not set
+# CONFIG_MEGARAID_MAILBOX is not set
+# CONFIG_FUSION is not set
+# CONFIG_SCSI_HPSA is not set
+# CONFIG_SCSI_SMARTPQI is not set
+
+# --- Ancient Ethernet NICs ---------------------------------------------------
+# Vendor menus for 10/100 hardware from the 90s/00s (3Com, Tulip, NatSemi,
+# NE2000-era, SiS 900, VIA Rhine/Velocity, Adaptec starfire). Modern NICs
+# (Intel/Realtek/Marvell/Broadcom/Aquantia) are untouched.
+# CONFIG_NET_VENDOR_3COM is not set
+# CONFIG_NET_VENDOR_ADAPTEC is not set
+# CONFIG_NET_TULIP is not set
+# CONFIG_NET_VENDOR_NATSEMI is not set
+# CONFIG_NET_VENDOR_8390 is not set
+# CONFIG_NET_VENDOR_SIS is not set
+# CONFIG_NET_VENDOR_VIA is not set
+
+# --- Specialized/legacy networking ------------------------------------------
+# CONFIG_ATM is not set
+# CONFIG_RDS is not set
+# CONFIG_TIPC is not set
+# CONFIG_PHONET is not set
+# CONFIG_IEEE802154 is not set
+# CONFIG_CAN is not set
+# CONFIG_NFC is not set
+# CONFIG_INFINIBAND is not set
+
+# --- Analog/digital TV, radio, legacy webcams --------------------------------
+# UVC (USB_VIDEO_CLASS) webcams stay enabled — handhelds use them.
+# CONFIG_MEDIA_ANALOG_TV_SUPPORT is not set
+# CONFIG_MEDIA_DIGITAL_TV_SUPPORT is not set
+# CONFIG_MEDIA_RADIO_SUPPORT is not set
+# CONFIG_USB_GSPCA is not set
+
+# --- Ancient/cluster filesystems ----------------------------------------------
+# Desktop FS (ext4/btrfs/xfs/f2fs/exfat/ntfs3/vfat/nfs/cifs) untouched.
+# CONFIG_MINIX_FS is not set
+# CONFIG_UFS_FS is not set
+# CONFIG_BFS_FS is not set
+# CONFIG_GFS2_FS is not set
+# CONFIG_OCFS2_FS is not set
+# CONFIG_AFS_FS is not set
+
+# --- Chemical / gas / air-quality sensors ------------------------------------
+# IMU/gyro/accelerometer/pressure/temp/humidity IIO drivers are KEPT
+# (handheld controllers need them); only gas/VOC/CO2/PM sensors removed.
+# CONFIG_CCS811 is not set
+# CONFIG_SPS30 is not set
+# CONFIG_PMS7003 is not set
+# CONFIG_SENSIRION_SGP30 is not set
+# CONFIG_SENSIRION_SGP40 is not set
+# CONFIG_SCD30_CORE is not set
+# CONFIG_SCD4X is not set
+# CONFIG_VZ89X is not set
+# CONFIG_BME680 is not set
+
+# --- Staging drivers ----------------------------------------------------------
+# All OGC handheld drivers live in mainline trees (drivers/hid,
+# drivers/platform/x86), not staging.
+# CONFIG_STAGING is not set
