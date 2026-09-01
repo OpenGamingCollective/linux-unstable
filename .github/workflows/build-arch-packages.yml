@@ -1,0 +1,163 @@
+# Arch Linux packaging, split out of build-kernel.yml.
+# Called (via `uses:`) by build-kernel.yml; runs inside the same workflow
+# run, so the artifacts uploaded here are seen by publish-release.yml.
+
+name: Build Arch Linux packages
+
+on:
+  workflow_call:
+    inputs:
+      krel:
+        description: Full kernel release string (uname -r), e.g. 6.12.0-next-20250101-unstable-ogc-g12345678-1
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Config fragments maintained by the OGC kernel-packages repository.
+  # The distro base config is extracted from the official Arch
+  # `linux-headers` package — same approach as the kernel-packages
+  # arch.yaml workflow.
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  build:
+    name: Build Arch Linux packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/archlinux:base-devel
+    env:
+      PKGDIR: /tmp/pkgbuild
+      DISTDIR: /tmp/dist
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ inputs.krel }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Bootstrap Arch Linux build environment
+        run: |
+          set -euxo pipefail
+          # Refresh keyring first to avoid signature failures on stale images
+          pacman -Sy --needed --noconfirm archlinux-keyring
+          pacman -Su --needed --noconfirm
+          # Everything makepkg needs (mirrors the makedepends of the PKGBUILD).
+          # rust + rust-bindgen are needed because the Arch config enables
+          # CONFIG_RUST=y.
+          pacman -S --needed --noconfirm \
+            bc cpio gettext libelf pahole perl python tar xz zstd \
+            gcc clang llvm lld ccache pigz file curl git \
+            rust rust-bindgen
+          # makepkg refuses to run as root
+          useradd -m build
+          install -d -o build -g build -m 0777 /ccache
+
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-arch-${{ github.sha }}
+          restore-keys: |
+            ccache-arch-
+
+      - name: Prepare ccache for the build user
+        run: chown -R build:build /ccache && su build -c 'ccache -s' || true
+
+      - name: Assemble Arch kernel config
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: extract the official Arch Linux kernel .config from
+          # the distro's `linux-headers` package (same method as the OGC
+          # kernel-packages arch.yaml workflow).
+          # ------------------------------------------------------------------
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
+          PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
+          if [ -z "$PKG" ]; then
+            echo "::error::linux-headers package not found in cache"; exit 1
+          fi
+          CFG="$(tar --zstd -tf "$PKG" | grep -E '^usr/lib/modules/[^/]+/build/\.config$' || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel .config not found inside $PKG"; exit 1
+          fi
+          tar --zstd -xOf "$PKG" "$CFG" > config
+          test -s config
+          rm -rf "$CACHE"
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments from kernel-packages on top, then
+          # the repo-local config.fragment (which wins). Order is critical:
+          # unsets apply first (removing things we explicitly don't want),
+          # then sets apply (enabling things we do want), so explicit enables
+          # can override explicit disables.
+          # ------------------------------------------------------------------
+          for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash ./merge-fragments.sh config \
+              arch.config.unset ogc.config.unset \
+              arch.config.set ogc.config.set \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
+
+      - name: Stage PKGBUILD directory
+        run: |
+          set -euxo pipefail
+          mkdir -p "${PKGDIR}" "${DISTDIR}"
+          cd /tmp/stage
+          cp PKGBUILD config.fragment linux.tar.gz config "${PKGDIR}/"
+          chown -R build:build "${PKGDIR}"
+
+      - name: Build packages with makepkg
+        run: |
+          set -euxo pipefail
+          cd "${PKGDIR}"
+          runuser -u build -- env HOME=/home/build CCACHE_DIR=/ccache \
+            makepkg -f --noconfirm --noprogressbar
+
+          ls -lh ./*.pkg.tar.zst
+          cp -v ./*.pkg.tar.zst "${DISTDIR}/"
+          # Ship the exact .config used for the build as well
+          cp -v "src/linux/.config" "${DISTDIR}/config-arch-${KREL}"
+
+      - name: Boot smoke test in QEMU (release gate)
+        run: |
+          set -euxo pipefail
+          pacman -S --needed --noconfirm qemu-system-x86 edk2-ovmf
+          # ----------------------------------------------------------------
+          # Boot the exact kernel image that ships in the package. This
+          # step fails the job (and with it the release) if the kernel
+          # panics, hangs or never reaches userspace, so an unbootable
+          # kernel is never uploaded or published.
+          # ----------------------------------------------------------------
+          WORK=/tmp/bootsmoke
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          PKG="$(find /tmp/dist -name 'linux-unstable-ogc-*.pkg.tar.zst' ! -name '*-headers-*' | head -n1)"
+          test -n "$PKG"
+          tar --zstd -xf "$PKG" -C "$WORK" "usr/lib/modules/${KREL}/vmlinuz"
+          test -s "$WORK/usr/lib/modules/${KREL}/vmlinuz"
+          bash /tmp/stage/boot-smoke-test.sh "$WORK/usr/lib/modules/${KREL}/vmlinuz"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf "${PKGDIR}/src" "${PKGDIR}/pkg" ; df -h /
+
+      - name: Upload Arch packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-packages
+          path: /tmp/dist
+          retention-days: 3

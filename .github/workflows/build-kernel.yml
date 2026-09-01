@@ -1,0 +1,129 @@
+# Entry point of the linux-unstable-ogc build pipeline. The heavy lifting
+# lives in reusable workflows next to this file:
+#
+#   build-arch-packages.yml    - Arch Linux .pkg.tar.zst builds
+#   build-fedora-packages.yml  - Fedora RPM builds
+#   build-debian-packages.yml  - Debian .deb builds
+#   publish-release.yml        - collects artifacts and cuts the GitHub release
+#
+# They are called with `uses:` so everything stays a single workflow run:
+# artifacts uploaded by the build jobs are downloaded by publish-release.yml,
+# and the needs: chain below keeps the release gated on the QEMU boot smoke
+# tests that run inside each build workflow.
+
+name: Build & release linux-unstable-ogc
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare sources and version
+    runs-on: ubuntu-latest
+    outputs:
+      kver: ${{ steps.kernel.outputs.kver }}
+      next: ${{ steps.kernel.outputs.next }}
+      sha8: ${{ steps.kernel.outputs.sha8 }}
+      krel: ${{ steps.kernel.outputs.krel }}
+      tag: ${{ steps.kernel.outputs.tag }}
+      kbase: ${{ steps.kernel.outputs.kbase }}
+      kverdot: ${{ steps.kernel.outputs.kverdot }}
+    steps:
+      - name: Checkout kernel sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Compute kernel version
+        id: kernel
+        run: |
+          set -euxo pipefail
+          KVER="$(make -s kernelversion)"
+          NEXT="$(cat localversion-next 2>/dev/null || true)"
+          SHA8="$(git rev-parse --short=8 HEAD)"
+          KREL="${KVER}${NEXT}-unstable-ogc-g${SHA8}-1"
+          TAG="v${KVER}${NEXT}-g${SHA8}"
+          # RPM Version: field must not contain hyphens
+          KVERDOT="$(printf '%s%s' "${KVER}" "${NEXT}" | tr '-' '.')"
+          echo "kver=${KVER}"     >> "$GITHUB_OUTPUT"
+          echo "next=${NEXT}"     >> "$GITHUB_OUTPUT"
+          echo "sha8=${SHA8}"     >> "$GITHUB_OUTPUT"
+          echo "krel=${KREL}"     >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+          echo "kbase=${KVER}${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "kverdot=${KVERDOT}"   >> "$GITHUB_OUTPUT"
+          echo "Kernel release: ${KREL}"
+          echo "Release tag:    ${TAG}"
+
+      - name: Stage sources and packaging files
+        run: |
+          set -euxo pipefail
+          # Commit marker consumed by the Arch PKGBUILD (same trick as
+          # linux-bisector). Written before the tarball is created so it is
+          # included in it.
+          git rev-parse --short=8 HEAD > .build_commit
+
+          STAGE="/tmp/stage"
+          mkdir -p "${STAGE}"
+          cp .github/packaging/PKGBUILD             "${STAGE}/PKGBUILD"
+          cp .github/packaging/merge-fragments.sh   "${STAGE}/merge-fragments.sh"
+          cp .github/packaging/config.fragment      "${STAGE}/config.fragment"
+          cp .github/packaging/fedora/kernel.spec   "${STAGE}/kernel.spec"
+          cp .github/packaging/boot-smoke-test.sh   "${STAGE}/boot-smoke-test.sh"
+
+          # Source tarball: contents of the repo as ./linux/, without VCS data.
+          tar --exclude-vcs -I 'gzip -1' -cf "${STAGE}/linux.tar.gz" \
+              --transform 's|^\./|linux/|' -C "$GITHUB_WORKSPACE" .
+          ls -lh "${STAGE}"
+
+      - name: Upload staged sources
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+          retention-days: 3
+
+  arch:
+    name: Arch packages
+    needs: prepare
+    uses: ./.github/workflows/build-arch-packages.yml
+    with:
+      krel: ${{ needs.prepare.outputs.krel }}
+
+  fedora:
+    name: Fedora packages
+    needs: prepare
+    uses: ./.github/workflows/build-fedora-packages.yml
+    with:
+      krel: ${{ needs.prepare.outputs.krel }}
+      kbase: ${{ needs.prepare.outputs.kbase }}
+      kverdot: ${{ needs.prepare.outputs.kverdot }}
+      sha8: ${{ needs.prepare.outputs.sha8 }}
+
+  debian:
+    name: Debian packages
+    needs: prepare
+    uses: ./.github/workflows/build-debian-packages.yml
+    with:
+      krel: ${{ needs.prepare.outputs.krel }}
+      kverdot: ${{ needs.prepare.outputs.kverdot }}
+      sha8: ${{ needs.prepare.outputs.sha8 }}
+
+  release:
+    name: Publish GitHub release
+    needs: [prepare, arch, fedora, debian]
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      krel: ${{ needs.prepare.outputs.krel }}
+      kver: ${{ needs.prepare.outputs.kver }}
+      next: ${{ needs.prepare.outputs.next }}
