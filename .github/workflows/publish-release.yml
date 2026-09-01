@@ -1,0 +1,157 @@
+# Release publisher, split out of build-kernel.yml.
+# Called (via `uses:`) by build-kernel.yml after all three distro builds
+# (each gated on its QEMU boot smoke test) have succeeded.
+
+name: Publish linux-unstable-ogc release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v6.12.0-next-20250101-g12345678
+        type: string
+        required: true
+      krel:
+        description: Full kernel release string (uname -r)
+        type: string
+        required: true
+      kver:
+        description: Base kernel version from `make kernelversion`
+        type: string
+        required: true
+      next:
+        description: localversion-next suffix (may be empty)
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Config fragments maintained by the OGC kernel-packages repository
+  # (referenced in the release notes).
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+      KREL: ${{ inputs.krel }}
+      KVER: ${{ inputs.kver }}
+      NEXT: ${{ inputs.next }}
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/dist
+          pattern: "*-packages"
+
+      - name: Flatten artifact directory
+        run: |
+          set -euxo pipefail
+          cd /tmp/dist
+          find . -mindepth 2 -maxdepth 2 -type f -exec mv -t . {} +
+          find . -mindepth 1 -type d -delete
+          ls -lh
+
+      - name: Generate checksums
+        run: |
+          set -euxo pipefail
+          cd /tmp/dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+
+          # Idempotency: if a stale release exists for this tag (e.g. re-run
+          # of the same commit), remove it so this run can recreate it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
+            echo "Deleting existing release $TAG, will recreate it"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          # In case a tag without a release is left over, drop it too.
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
+
+          NOTES="$(mktemp)"
+          {
+            echo "Automated build of linux-unstable-ogc."
+            echo
+            echo "- Source commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "- Kernel release: ${KREL}"
+            echo "- Upstream version: ${KVER}${NEXT}"
+            echo "- Base configs: Arch \`linux-headers\` + Fedora \`kernel-core\`, plus [OGC kernel-packages fragments](${KERNEL_PACKAGES_RAW}/config)"
+            echo "- Compiler: clang / LLVM=1 (with ccache)"
+            echo "- Boot smoke test: every packaged kernel (Arch, Fedora, Debian) was booted in QEMU and reached userspace init before publishing"
+            echo
+            echo "### Artifacts"
+            echo
+            echo "#### Arch Linux"
+            echo
+            echo '- `linux-unstable-ogc` — kernel image and modules'
+            echo '- `linux-unstable-ogc-headers` — headers for building external modules'
+            echo "- \`config-arch-${KREL}\` — the exact .config used for this build"
+            echo
+            echo "#### Fedora"
+            echo
+            echo '- `kernel-unstable-ogc-core` — kernel image (vmlinuz) and core files'
+            echo '- `kernel-unstable-ogc-modules` — kernel modules'
+            echo '- `kernel-unstable-ogc-devel` — headers for building external modules'
+            echo "- \`config-fedora-${KREL}\` — the exact .config used for this build"
+            echo
+            echo "#### Debian (and derivatives)"
+            echo
+            echo "- \`linux-image-${KREL}\` — kernel image and modules"
+            echo "- \`linux-headers-${KREL}\` — headers for building external modules"
+            echo "- \`config-debian-${KREL}\` — the exact .config used for this build"
+            echo
+            echo '- `SHA256SUMS` — checksums of all artifacts'
+            echo
+            echo "### Install"
+            echo
+            echo "Arch Linux:"
+            echo
+            echo '```sh'
+            echo 'sudo pacman -U linux-unstable-ogc-headers-*.pkg.tar.zst linux-unstable-ogc-*.pkg.tar.zst'
+            echo '```'
+            echo
+            echo "Fedora:"
+            echo
+            echo '```sh'
+            echo 'sudo dnf install ./kernel-unstable-ogc-core-*.rpm ./kernel-unstable-ogc-modules-*.rpm'
+            echo '```'
+            echo
+            echo "Debian and derivatives:"
+            echo
+            echo '```sh'
+            echo 'sudo apt install ./linux-image-*.deb ./linux-headers-*.deb'
+            echo '```'
+            echo
+            echo "> The initramfs is generated automatically on install (mkinitcpio hooks"
+            echo "> on Arch, kernel-install/dracut on Fedora, initramfs-tools hooks on Debian)."
+          } > "$NOTES"
+
+          cd /tmp/dist
+          # Upload every artifact produced by the distro jobs (package files
+          # plus the config-* files). SHA256SUMS itself is included by ./*.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "linux-unstable-ogc ${KREL}" \
+            --notes-file "$NOTES" \
+            ./*
+
+      - name: Summary
+        run: |
+          {
+            echo "## linux-unstable-ogc build"
+            echo
+            echo "- Kernel release: \`${KREL}\`"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            echo "- QEMU boot smoke test: passed (Arch, Fedora and Debian kernel images booted to userspace init)"
+          } >> "$GITHUB_STEP_SUMMARY"
