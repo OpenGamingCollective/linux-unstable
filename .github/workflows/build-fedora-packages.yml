@@ -1,0 +1,207 @@
+# Fedora RPM packaging, split out of build-kernel.yml.
+# Called (via `uses:`) by build-kernel.yml; runs inside the same workflow
+# run, so the artifacts uploaded here are seen by publish-release.yml.
+
+name: Build Fedora RPM packages
+
+on:
+  workflow_call:
+    inputs:
+      krel:
+        description: Full kernel release string (uname -r), e.g. 6.12.0-next-20250101-unstable-ogc-g12345678-1
+        type: string
+        required: true
+      kbase:
+        description: Base kernel version incl. prerelease suffix but no packaging suffix (e.g. 6.12.0-next-20250101)
+        type: string
+        required: true
+      kverdot:
+        description: Kernel version with hyphens replaced by dots, for the RPM Version field
+        type: string
+        required: true
+      sha8:
+        description: Short (8 char) source commit the packages are built from
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Config fragments maintained by the OGC kernel-packages repository.
+  # The distro base config is extracted from the official Fedora
+  # `kernel-core` package — same approach as the kernel-packages
+  # fedora.yaml workflow.
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  build:
+    name: Build Fedora RPM packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/library/fedora:43
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ inputs.krel }}
+      KBASE: ${{ inputs.kbase }}
+      KVERDOT: ${{ inputs.kverdot }}
+      SHA8: ${{ inputs.sha8 }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          dnf -y install dnf5-plugins rpm-build
+          dnf -y install cpio curl findutils tar gzip
+          mkdir -p /ccache
+
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-fedora-${{ github.sha }}
+          restore-keys: |
+            ccache-fedora-
+
+      - name: Assemble Fedora kernel config
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: extract the official Fedora kernel .config from the
+          # distro's `kernel-core` package (same method as the OGC
+          # kernel-packages fedora.yaml workflow).
+          # ------------------------------------------------------------------
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          dnf download --destdir "$CACHE" kernel-core
+          RPM="$(find "$CACHE" -maxdepth 1 -name 'kernel-core-*.rpm' -type f)"
+          if [ -z "$RPM" ]; then
+            echo "::error::kernel-core package not found in cache"; exit 1
+          fi
+          CFG="$(rpm -qlp "$RPM" | grep -E '^/lib/modules/[^/]+/config$' | head -n1 || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel config not found inside $RPM"; exit 1
+          fi
+          rpm2cpio "$RPM" | cpio -i --to-stdout ".${CFG}" > config
+          test -s config
+          rm -rf "$CACHE"
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments on top, then the repo-local
+          # config.fragment (which wins). Order is critical: unsets apply
+          # first (removing things we explicitly don't want), then sets apply
+          # (enabling things we do want), so explicit enables can override
+          # explicit disables.
+          # ------------------------------------------------------------------
+          for f in fedora.config.set ogc.config.set fedora.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash ./merge-fragments.sh config \
+              fedora.config.unset ogc.config.unset \
+              fedora.config.set ogc.config.set \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
+
+      - name: Finalize spec and install build dependencies
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # Substitute the CI placeholders (must happen before `dnf builddep`
+          # so RPM can parse Version:/Release:).
+          sed -i \
+            -e "s/@@KBASEVER@@/${KBASE}/" \
+            -e "s/@@KVERDOTTED@@/${KVERDOT}/" \
+            -e "s/@@SHA8@@/${SHA8}/" \
+            kernel.spec
+          grep -n '^Version:\|^Release:\|%define kbasever\|%define sha8' kernel.spec
+          ! grep -q '@@' kernel.spec
+
+          # Installs the toolchain from the spec BuildRequires, including the
+          # distro dwarves/pahole. Run BEFORE the pahole check below so a
+          # source-built pahole is not overwritten by builddep.
+          dnf -y builddep kernel.spec
+
+      - name: Ensure pahole >= 1.31 (sched_ext/BTF)
+        working-directory: /tmp
+        run: |
+          set -euxo pipefail
+          VER="$(pahole --version | tr -d 'v')"
+          MAJ="${VER%%.*}"; MIN="${VER#*.}"; MIN="${MIN%%.*}"
+          echo "Installed pahole: ${VER}"
+          if [ "$MAJ" -lt 1 ] || { [ "$MAJ" -eq 1 ] && [ "$MIN" -lt 31 ]; }; then
+            echo "pahole < 1.31 breaks sched_ext; building dwarves 1.31 from source"
+            dnf -y install cmake make gcc elfutils-devel zlib-devel
+            curl -fsSLO https://fedorapeople.org/~acme/dwarves/dwarves-1.31.tar.xz
+            echo "0a7f255ccacf8cc7f8cd119099eb327179b4b3c67cb015af646af6d0cb03054d  dwarves-1.31.tar.xz" | sha256sum -c
+            tar -xf dwarves-1.31.tar.xz
+            cmake -B dwarves-1.31/build -S dwarves-1.31 \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -D__LIB=lib
+            make -C dwarves-1.31/build -j"$(nproc)" install
+          fi
+          pahole --version
+
+      - name: Build RPMs with rpmbuild
+        working-directory: /tmp
+        run: |
+          set -euxo pipefail
+          TOPDIR=/tmp/rpmbuild
+          mkdir -p "${TOPDIR}"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp /tmp/stage/linux.tar.gz "${TOPDIR}/SOURCES/"
+          cp /tmp/stage/config        "${TOPDIR}/SOURCES/config"
+          cp /tmp/stage/kernel.spec   "${TOPDIR}/SPECS/kernel.spec"
+
+          rpmbuild --define "_topdir ${TOPDIR}" -ba "${TOPDIR}/SPECS/kernel.spec"
+
+          ls -lh "${TOPDIR}"/RPMS/x86_64/
+
+      - name: Collect Fedora artifacts
+        run: |
+          set -euxo pipefail
+          DISTDIR=/tmp/dist
+          mkdir -p "${DISTDIR}"
+          cp -v /tmp/rpmbuild/RPMS/x86_64/*.rpm "${DISTDIR}/"
+          cp -v /tmp/stage/config "${DISTDIR}/config-fedora-${KREL}"
+          ls -lh "${DISTDIR}"
+
+      - name: Boot smoke test in QEMU (release gate)
+        run: |
+          set -euxo pipefail
+          dnf -y install qemu-system-x86 edk2-ovmf
+          # ----------------------------------------------------------------
+          # Boot the exact kernel image that ships in the kernel-core RPM.
+          # This step fails the job (and with it the release) if the kernel
+          # panics, hangs or never reaches userspace, so an unbootable
+          # kernel is never uploaded or published.
+          # ----------------------------------------------------------------
+          WORK=/tmp/bootsmoke
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          RPM="$(find /tmp/dist -name 'kernel-unstable-ogc-core-*.rpm' | head -n1)"
+          test -n "$RPM"
+          # rpm cpio entries are stored with a "./" prefix (same trick as
+          # the config extraction above).
+          rpm2cpio "$RPM" | cpio -idm --quiet -D "$WORK" "./lib/modules/${KREL}/vmlinuz" || true
+          IMG="$WORK/lib/modules/${KREL}/vmlinuz"
+          test -s "$IMG" || { echo "::error::vmlinuz not found inside ${RPM}"; exit 1; }
+          bash /tmp/stage/boot-smoke-test.sh "$IMG"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf /tmp/rpmbuild/BUILD /tmp/rpmbuild/BUILDROOT ; df -h /
+
+      - name: Upload Fedora packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: fedora-packages
+          path: /tmp/dist
+          retention-days: 3

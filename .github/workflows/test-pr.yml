@@ -1,0 +1,227 @@
+name: Test PR (checkpatch + config gate + gcc build)
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  checks:
+    name: Static checks (checkpatch, new-driver symbols)
+    runs-on: ubuntu-latest
+    outputs:
+      new_symbols: ${{ steps.syms.outputs.syms }}
+    steps:
+      - name: Checkout PR merge result
+        uses: actions/checkout@v7
+        with:
+          # Default ref for pull_request is the merge commit refs/pull/N/merge.
+          # depth 2 fetches the merge commit AND its parents, so HEAD^1
+          # (current master tip) is present and the PR diff is exactly
+          # "what landing this PR changes on master".
+          fetch-depth: 2
+
+      - name: Compute PR patch and new driver symbols
+        id: syms
+        run: |
+          set -euo pipefail
+          # For pull_request, checkout gets the merge commit refs/pull/N/merge:
+          # parent 1 = master tip, parent 2 = PR head. Fall back to
+          # origin/master if HEAD is not a merge commit for any reason.
+          BASE="$(git rev-parse --verify -q HEAD^1 || true)"
+          if [ -z "$BASE" ]; then
+            echo "HEAD^1 unresolvable; falling back to origin/master"
+            git fetch --depth=1 origin master
+            BASE="$(git rev-parse --verify -q FETCH_HEAD || true)"
+          fi
+          if [ -z "$BASE" ]; then
+            echo "::error::Could not determine the base commit for the PR diff."
+            exit 1
+          fi
+          git diff "$BASE" HEAD > /tmp/pr.patch
+
+          if [ ! -s /tmp/pr.patch ]; then
+            echo "Empty patch; nothing to check."
+            echo "syms=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Selectable symbols introduced under drivers/ (added
+          # "config FOO" / "menuconfig FOO" lines in any Kconfig file).
+          # NOTE: grep exits 1 on zero matches; under `set -euo pipefail`
+          # that would abort the step, so it is neutralised here only
+          # (git diff / awk failures still propagate).
+          SYMS="$(git diff "$BASE" HEAD -- drivers/ \
+            | { grep -E '^\+[[:space:]]*(menu)?config[[:space:]]+[A-Z0-9_]+' || true; } \
+            | awk '{print $NF}' | sort -u | tr '\n' ' ')"
+          echo "syms=${SYMS}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### PR checks"
+            echo
+            echo "- Changed files: $(git diff --name-only "$BASE" HEAD | wc -l)"
+            echo "- New driver CONFIG symbols: ${SYMS:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: checkpatch (fail on errors)
+        run: |
+          set -uo pipefail
+          if [ ! -s /tmp/pr.patch ]; then
+            echo "Empty patch; skipping checkpatch."
+            exit 0
+          fi
+          # --no-signoff: internal fork PRs do not require Signed-off-by.
+          perl scripts/checkpatch.pl --no-signoff /tmp/pr.patch \
+            > /tmp/checkpatch.out 2>&1 || true
+          cat /tmp/checkpatch.out
+
+          if grep -q '^ERROR:' /tmp/checkpatch.out; then
+            NERRS="$(grep -c '^ERROR:' /tmp/checkpatch.out)"
+            echo "::error::checkpatch reported ${NERRS} error(s); fix them before merge (warnings do not block)."
+            exit 1
+          fi
+          echo "checkpatch: no errors."
+
+  build:
+    name: Build with GCC (Arch config + fragments)
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/archlinux:base-devel
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      NEW_SYMBOLS: ${{ needs.checks.outputs.new_symbols }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Bootstrap build environment
+        run: |
+          set -euxo pipefail
+          pacman -Sy --needed --noconfirm archlinux-keyring
+          pacman -Su --needed --noconfirm
+          # base-devel provides gcc/make/perl; the rest mirrors the makedepends
+          # of the release PKGBUILD minus clang and the rust toolchain.
+          pacman -S --needed --noconfirm \
+            bc cpio gettext libelf pahole perl python tar xz zstd \
+            file curl git ccache
+
+      - name: Checkout PR merge result
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-pr-gcc-${{ github.sha }}
+          restore-keys: |
+            ccache-pr-gcc-
+
+      - name: Assemble test config (same as the Arch release build)
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: official Arch Linux kernel .config extracted from the
+          # distro's linux-headers package (same method as the release build).
+          # ------------------------------------------------------------------
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
+          PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
+          if [ -z "$PKG" ]; then
+            echo "::error::linux-headers package not found in cache"; exit 1
+          fi
+          CFG="$(tar --zstd -tf "$PKG" | grep -E '^usr/lib/modules/[^/]+/build/\.config$' || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel .config not found inside $PKG"; exit 1
+          fi
+          tar --zstd -xOf "$PKG" "$CFG" > .config
+          test -s .config
+          rm -rf "$CACHE"
+
+          # ------------------------------------------------------------------
+          # OGC kernel-packages fragments + the repo-local config.fragment
+          # (merged last, wins). Same order as the release build.
+          # ------------------------------------------------------------------
+          for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash .github/packaging/merge-fragments.sh .config \
+              arch.config.set ogc.config.set \
+              arch.config.unset ogc.config.unset \
+              .github/packaging/config.fragment
+
+          # Same fixups as the release packaging...
+          scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+          scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+          scripts/config --set-str CONFIG_LOCALVERSION "" || true
+          # ...plus test-only tweaks:
+          # No rust toolchain is installed in this job; the release builds
+          # (clang) compile the rust bits, this job focuses on the C parts.
+          scripts/config -d RUST
+          make olddefconfig
+
+      - name: "Gate: new driver symbols must be enabled in the config"
+        run: |
+          set -euo pipefail
+          if [ -z "${NEW_SYMBOLS// }" ]; then
+            echo "No new driver CONFIG symbols in this PR; skipping gate."
+            exit 0
+          fi
+          echo "Gate symbols: ${NEW_SYMBOLS}"
+
+          FAIL=0
+          for s in ${NEW_SYMBOLS}; do
+            if grep -qE "^CONFIG_${s}=[ym]$" .config; then
+              echo "OK: CONFIG_${s} is enabled."
+            elif grep -q "^# CONFIG_${s} is not set$" .config; then
+              echo "::error::CONFIG_${s} was added by this PR but is disabled in the merged config."
+              echo "::error::Enable it in .github/packaging/config.fragment (CONFIG_${s}=y or =m) if it should ship."
+              FAIL=1
+            elif grep -q "^CONFIG_${s}=" .config; then
+              echo "::error::CONFIG_${s} is set but not to y/m: $(grep "^CONFIG_${s}=" .config)"
+              FAIL=1
+            else
+              echo "::error::CONFIG_${s} is absent from the final .config (its dependencies or its vendor menu are off in the merged config)."
+              echo "::error::If this driver should ship, enable it (and its dependencies) in .github/packaging/config.fragment."
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::config gate failed: new drivers must be enabled in the OGC config."
+            exit 1
+          fi
+          echo "config gate passed."
+
+      - name: Build kernel with GCC
+        run: |
+          set -euxo pipefail
+          ccache -s || true
+          make CC="ccache gcc" WERROR=0 -j"$(nproc)" all
+          echo "Kernel release: $(make -s kernelrelease)"
+          ccache -s
+          df -h /
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### GCC compile test"
+            echo
+            echo "- Compiler: gcc (Arch Linux) via ccache"
+            echo "- Config: Arch linux-headers base + OGC fragments + repo config.fragment (Rust disabled for this test)"
+            echo "- New driver symbols checked: ${NEW_SYMBOLS:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
