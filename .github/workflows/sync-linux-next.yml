@@ -1,0 +1,137 @@
+name: Sync linux-next -> master (replay fork commits)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # every day at 02:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-linux-next
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure upstream
+        run: |
+          git remote remove upstream || true
+          git remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+          git fetch --no-tags upstream --prune
+
+      - name: Replay fork commits on top of upstream/master
+        run: |
+          set -euo pipefail
+
+          git checkout master
+
+          # REQUIRED for cherry-pick commit creation (runner has no identity by default)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          UP_BASE="upstream/master"
+          git show -s --oneline "$UP_BASE" >/dev/null
+
+          # ------------------------------------------------------------------
+          # Find the upstream snapshot that master's fork commits sit on.
+          #
+          # linux-next is rebuilt from scratch every day: commits merged into
+          # yesterday's tree are regularly dropped from today's history
+          # (subsystem trees get rebased), so:
+          #   - "upstream/master..master" contains hundreds of unrelated
+          #     upstream commits, not just our fork commits, and
+          #   - a hardcoded marker hash gets orphaned by the very replay this
+          #     workflow performs (run #2 then dies with "unknown revision",
+          #     which is how this workflow broke in the first place).
+          #
+          # Anchor: walk first-parent history from master and stop at the
+          # second consecutive commit whose subject does not start with
+          # "ogc:" (the reserved prefix of every fork commit; cherry-pick
+          # preserves subjects, so this survives replays and force-pushes).
+          # The first of those two commits is the upstream snapshot the fork
+          # was built on.
+          # ------------------------------------------------------------------
+          BASE=""
+          NONOGC=""
+          while read -r c; do
+            case "$(git show -s --format=%s "$c")" in
+              ogc:*) NONOGC="" ;;
+                *)
+                  if [ -n "$NONOGC" ]; then BASE="$NONOGC"; break; fi
+                  NONOGC="$c"
+                  ;;
+            esac
+          done < <(git rev-list --first-parent master)
+
+          if [ -z "$BASE" ]; then
+            echo "::error::Could not determine the upstream base of the fork; refusing to touch master."
+            exit 1
+          fi
+          echo "Upstream base: $(git show -s --oneline "$BASE")"
+
+          # If master already sits on the current upstream tip there is
+          # nothing to sync: replaying would only churn the fork commits'
+          # hashes for identical content.
+          if [ "$(git rev-parse "$BASE")" = "$(git rev-parse "$UP_BASE")" ]; then
+            echo "master is already based on the current linux-next tip; nothing to do."
+            exit 0
+          fi
+
+          # Everything on master on top of the upstream base = the fork
+          # commits (including non-"ogc:"-prefixed ones, e.g. squash-merged
+          # PRs). --no-merges matches the cherry-pick loop below and makes
+          # merge commits replay as their constituent commits.
+          MY_COMMITS="$(git rev-list --reverse --no-merges "${BASE}..master")"
+          if [ -z "${MY_COMMITS// }" ]; then
+            echo "::error::No commits found on top of the upstream base; refusing to reset master (that would delete the fork)."
+            exit 1
+          fi
+
+          # Safety net: a mis-detected base would replay days of upstream
+          # history. The fork accumulates its own commits over time (and PR
+          # squash-merges add to that), so allow a generous 150; anything
+          # beyond that is far more likely a mis-detected base than real fork
+          # commits, so bail out and ask for a manual look instead of
+          # corrupting master.
+          N="$(echo "$MY_COMMITS" | wc -l)"
+          if [ "$N" -gt 150 ]; then
+            echo "::error::Refusing to replay ${N} commits (expected only fork commits). Check master's history (all fork commits must carry the 'ogc:' subject prefix)."
+            exit 1
+          fi
+
+          echo "Replaying ${N} commit(s):"
+          for c in $MY_COMMITS; do
+            echo "  $c  $(git show -s --format=%s "$c")"
+          done
+          echo
+
+          # Reset master to the new upstream tip, then replay the fork commits.
+          git reset --hard "$UP_BASE"
+
+          for c in $MY_COMMITS; do
+            echo "Cherry-picking: $c  $(git show -s --format=%s "$c")"
+
+            if ! git cherry-pick -x --allow-empty "$c"; then
+              git status || true
+              # If we're left mid-cherry-pick, abort to avoid a broken
+              # working state. Nothing was pushed, so master on origin is
+              # still intact.
+              if [ -f .git/CHERRY_PICK_HEAD ]; then
+                git cherry-pick --abort || true
+              fi
+              echo "::error::Cherry-pick failed for $c; nothing was pushed."
+              exit 1
+            fi
+          done
+
+          echo "Done. Pushing updated master."
+          git push --force-with-lease origin master

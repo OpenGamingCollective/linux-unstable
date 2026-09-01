@@ -1,0 +1,721 @@
+name: Build & release linux-unstable-ogc
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Config fragments maintained by the OGC kernel-packages repository.
+  # Distro base configs are extracted from the official distro packages
+  # (Arch: linux-headers, Fedora: kernel-core) — same approach as the
+  # kernel-packages arch.yaml / fedora.yaml workflows.
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  prepare:
+    name: Prepare sources and version
+    runs-on: ubuntu-latest
+    outputs:
+      kver: ${{ steps.kernel.outputs.kver }}
+      next: ${{ steps.kernel.outputs.next }}
+      sha8: ${{ steps.kernel.outputs.sha8 }}
+      krel: ${{ steps.kernel.outputs.krel }}
+      tag: ${{ steps.kernel.outputs.tag }}
+      kbase: ${{ steps.kernel.outputs.kbase }}
+      kverdot: ${{ steps.kernel.outputs.kverdot }}
+    steps:
+      - name: Checkout kernel sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Compute kernel version
+        id: kernel
+        run: |
+          set -euxo pipefail
+          KVER="$(make -s kernelversion)"
+          NEXT="$(cat localversion-next 2>/dev/null || true)"
+          SHA8="$(git rev-parse --short=8 HEAD)"
+          KREL="${KVER}${NEXT}-unstable-ogc-g${SHA8}-1"
+          TAG="v${KVER}${NEXT}-g${SHA8}"
+          # RPM Version: field must not contain hyphens
+          KVERDOT="$(printf '%s%s' "${KVER}" "${NEXT}" | tr '-' '.')"
+          echo "kver=${KVER}"     >> "$GITHUB_OUTPUT"
+          echo "next=${NEXT}"     >> "$GITHUB_OUTPUT"
+          echo "sha8=${SHA8}"     >> "$GITHUB_OUTPUT"
+          echo "krel=${KREL}"     >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+          echo "kbase=${KVER}${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "kverdot=${KVERDOT}"   >> "$GITHUB_OUTPUT"
+          echo "Kernel release: ${KREL}"
+          echo "Release tag:    ${TAG}"
+
+      - name: Stage sources and packaging files
+        run: |
+          set -euxo pipefail
+          # Commit marker consumed by the Arch PKGBUILD (same trick as
+          # linux-bisector). Written before the tarball is created so it is
+          # included in it.
+          git rev-parse --short=8 HEAD > .build_commit
+
+          STAGE="/tmp/stage"
+          mkdir -p "${STAGE}"
+          cp .github/packaging/PKGBUILD             "${STAGE}/PKGBUILD"
+          cp .github/packaging/merge-fragments.sh   "${STAGE}/merge-fragments.sh"
+          cp .github/packaging/config.fragment      "${STAGE}/config.fragment"
+          cp .github/packaging/fedora/kernel.spec   "${STAGE}/kernel.spec"
+
+          # Source tarball: contents of the repo as ./linux/, without VCS data.
+          tar --exclude-vcs -I 'gzip -1' -cf "${STAGE}/linux.tar.gz" \
+              --transform 's|^\./|linux/|' -C "$GITHUB_WORKSPACE" .
+          ls -lh "${STAGE}"
+
+      - name: Upload staged sources
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+          retention-days: 3
+
+  arch:
+    name: Build Arch Linux packages
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/archlinux:base-devel
+    env:
+      PKGDIR: /tmp/pkgbuild
+      DISTDIR: /tmp/dist
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ needs.prepare.outputs.krel }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Bootstrap Arch Linux build environment
+        run: |
+          set -euxo pipefail
+          # Refresh keyring first to avoid signature failures on stale images
+          pacman -Sy --needed --noconfirm archlinux-keyring
+          pacman -Su --needed --noconfirm
+          # Everything makepkg needs (mirrors the makedepends of the PKGBUILD).
+          # rust + rust-bindgen are needed because the Arch config enables
+          # CONFIG_RUST=y.
+          pacman -S --needed --noconfirm \
+            bc cpio gettext libelf pahole perl python tar xz zstd \
+            gcc clang llvm lld ccache pigz file curl git \
+            rust rust-bindgen
+          # makepkg refuses to run as root
+          useradd -m build
+          install -d -o build -g build -m 0777 /ccache
+
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-arch-${{ github.sha }}
+          restore-keys: |
+            ccache-arch-
+
+      - name: Prepare ccache for the build user
+        run: chown -R build:build /ccache && su build -c 'ccache -s' || true
+
+      - name: Assemble Arch kernel config
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: extract the official Arch Linux kernel .config from
+          # the distro's `linux-headers` package (same method as the OGC
+          # kernel-packages arch.yaml workflow).
+          # ------------------------------------------------------------------
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
+          PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
+          if [ -z "$PKG" ]; then
+            echo "::error::linux-headers package not found in cache"; exit 1
+          fi
+          CFG="$(tar --zstd -tf "$PKG" | grep -E '^usr/lib/modules/[^/]+/build/\.config$' || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel .config not found inside $PKG"; exit 1
+          fi
+          tar --zstd -xOf "$PKG" "$CFG" > config
+          test -s config
+          rm -rf "$CACHE"
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments from kernel-packages on top, then
+          # the repo-local config.fragment (which wins). Order is critical:
+          # unsets apply first (removing things we explicitly don't want),
+          # then sets apply (enabling things we do want), so explicit enables
+          # can override explicit disables.
+          # ------------------------------------------------------------------
+          for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash ./merge-fragments.sh config \
+              arch.config.unset ogc.config.unset \
+              arch.config.set ogc.config.set \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
+
+      - name: Stage PKGBUILD directory
+        run: |
+          set -euxo pipefail
+          mkdir -p "${PKGDIR}" "${DISTDIR}"
+          cd /tmp/stage
+          cp PKGBUILD config.fragment linux.tar.gz config "${PKGDIR}/"
+          chown -R build:build "${PKGDIR}"
+
+      - name: Build packages with makepkg
+        run: |
+          set -euxo pipefail
+          cd "${PKGDIR}"
+          runuser -u build -- env HOME=/home/build CCACHE_DIR=/ccache \
+            makepkg -f --noconfirm --noprogressbar
+
+          ls -lh ./*.pkg.tar.zst
+          cp -v ./*.pkg.tar.zst "${DISTDIR}/"
+          # Ship the exact .config used for the build as well
+          cp -v "src/linux/.config" "${DISTDIR}/config-arch-${KREL}"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf "${PKGDIR}/src" "${PKGDIR}/pkg" ; df -h /
+
+      - name: Upload Arch packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-packages
+          path: /tmp/dist
+          retention-days: 3
+
+  fedora:
+    name: Build Fedora RPM packages
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/library/fedora:43
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ needs.prepare.outputs.krel }}
+      KBASE: ${{ needs.prepare.outputs.kbase }}
+      KVERDOT: ${{ needs.prepare.outputs.kverdot }}
+      SHA8: ${{ needs.prepare.outputs.sha8 }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          dnf -y install dnf5-plugins rpm-build
+          dnf -y install cpio curl findutils tar gzip
+          mkdir -p /ccache
+
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-fedora-${{ github.sha }}
+          restore-keys: |
+            ccache-fedora-
+
+      - name: Assemble Fedora kernel config
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: extract the official Fedora kernel .config from the
+          # distro's `kernel-core` package (same method as the OGC
+          # kernel-packages fedora.yaml workflow).
+          # ------------------------------------------------------------------
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          dnf download --destdir "$CACHE" kernel-core
+          RPM="$(find "$CACHE" -maxdepth 1 -name 'kernel-core-*.rpm' -type f)"
+          if [ -z "$RPM" ]; then
+            echo "::error::kernel-core package not found in cache"; exit 1
+          fi
+          CFG="$(rpm -qlp "$RPM" | grep -E '^/lib/modules/[^/]+/config$' | head -n1 || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel config not found inside $RPM"; exit 1
+          fi
+          rpm2cpio "$RPM" | cpio -i --to-stdout ".${CFG}" > config
+          test -s config
+          rm -rf "$CACHE"
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments on top, then the repo-local
+          # config.fragment (which wins). Order is critical: unsets apply
+          # first (removing things we explicitly don't want), then sets apply
+          # (enabling things we do want), so explicit enables can override
+          # explicit disables.
+          # ------------------------------------------------------------------
+          for f in fedora.config.set ogc.config.set fedora.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash ./merge-fragments.sh config \
+              fedora.config.unset ogc.config.unset \
+              fedora.config.set ogc.config.set \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
+
+      - name: Finalize spec and install build dependencies
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # Substitute the CI placeholders (must happen before `dnf builddep`
+          # so RPM can parse Version:/Release:).
+          sed -i \
+            -e "s/@@KBASEVER@@/${KBASE}/" \
+            -e "s/@@KVERDOTTED@@/${KVERDOT}/" \
+            -e "s/@@SHA8@@/${SHA8}/" \
+            kernel.spec
+          grep -n '^Version:\|^Release:\|%define kbasever\|%define sha8' kernel.spec
+          ! grep -q '@@' kernel.spec
+
+          # Installs the toolchain from the spec BuildRequires, including the
+          # distro dwarves/pahole. Run BEFORE the pahole check below so a
+          # source-built pahole is not overwritten by builddep.
+          dnf -y builddep kernel.spec
+
+      - name: Ensure pahole >= 1.31 (sched_ext/BTF)
+        working-directory: /tmp
+        run: |
+          set -euxo pipefail
+          VER="$(pahole --version | tr -d 'v')"
+          MAJ="${VER%%.*}"; MIN="${VER#*.}"; MIN="${MIN%%.*}"
+          echo "Installed pahole: ${VER}"
+          if [ "$MAJ" -lt 1 ] || { [ "$MAJ" -eq 1 ] && [ "$MIN" -lt 31 ]; }; then
+            echo "pahole < 1.31 breaks sched_ext; building dwarves 1.31 from source"
+            dnf -y install cmake make gcc elfutils-devel zlib-devel
+            curl -fsSLO https://fedorapeople.org/~acme/dwarves/dwarves-1.31.tar.xz
+            echo "0a7f255ccacf8cc7f8cd119099eb327179b4b3c67cb015af646af6d0cb03054d  dwarves-1.31.tar.xz" | sha256sum -c
+            tar -xf dwarves-1.31.tar.xz
+            cmake -B dwarves-1.31/build -S dwarves-1.31 \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -D__LIB=lib
+            make -C dwarves-1.31/build -j"$(nproc)" install
+          fi
+          pahole --version
+
+      - name: Build RPMs with rpmbuild
+        working-directory: /tmp
+        run: |
+          set -euxo pipefail
+          TOPDIR=/tmp/rpmbuild
+          mkdir -p "${TOPDIR}"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp /tmp/stage/linux.tar.gz "${TOPDIR}/SOURCES/"
+          cp /tmp/stage/config        "${TOPDIR}/SOURCES/config"
+          cp /tmp/stage/kernel.spec   "${TOPDIR}/SPECS/kernel.spec"
+
+          rpmbuild --define "_topdir ${TOPDIR}" -ba "${TOPDIR}/SPECS/kernel.spec"
+
+          ls -lh "${TOPDIR}"/RPMS/x86_64/
+
+      - name: Collect Fedora artifacts
+        run: |
+          set -euxo pipefail
+          DISTDIR=/tmp/dist
+          mkdir -p "${DISTDIR}"
+          cp -v /tmp/rpmbuild/RPMS/x86_64/*.rpm "${DISTDIR}/"
+          cp -v /tmp/stage/config "${DISTDIR}/config-fedora-${KREL}"
+          ls -lh "${DISTDIR}"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf /tmp/rpmbuild/BUILD /tmp/rpmbuild/BUILDROOT ; df -h /
+
+      - name: Upload Fedora packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: fedora-packages
+          path: /tmp/dist
+          retention-days: 3
+
+  debian:
+    name: Build Debian packages
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/library/debian:trixie
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+      KREL: ${{ needs.prepare.outputs.krel }}
+      KVERDOT: ${{ needs.prepare.outputs.kverdot }}
+      SHA8: ${{ needs.prepare.outputs.sha8 }}
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          apt-get update
+          # Satisfies the Build-Depends generated by scripts/package/mkdebian
+          # (debhelper-compat, bc, bison, flex, kmod, libdw/libelf/libssl-dev,
+          # python3, rsync) plus the clang toolchain used by all OGC builds.
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper rsync \
+            bc bison flex python3 kmod \
+            libelf-dev libdw-dev libssl-dev zlib1g-dev \
+            dwarves zstd xz-utils \
+            clang llvm lld ccache curl ca-certificates git \
+            openssl
+          # dpkg-buildpackage refuses to run as root
+          useradd -m builder
+          install -d -o builder -g builder -m 0777 /ccache
+
+      - name: Download staged sources
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-sources
+          path: /tmp/stage
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          key: ccache-debian-${{ github.sha }}
+          restore-keys: |
+            ccache-debian-
+
+      - name: Assemble Debian kernel config
+        working-directory: /tmp/stage
+        run: |
+          set -euxo pipefail
+          # ------------------------------------------------------------------
+          # Base config: the official Debian kernel configuration. It ships in
+          # the small linux-config-<abi> package; fall back to /boot/config-*
+          # of the linux-image-<abi> package if that is unavailable.
+          # ------------------------------------------------------------------
+          ABI="$(apt-cache depends linux-image-amd64 \
+            | awk '/^ *Depends: *linux-image-[0-9]/ {print $2; exit}' \
+            | sed 's/^linux-image-//')"
+          test -n "${ABI}"
+          echo "Debian kernel ABI: ${ABI}"
+          # linux-config is versioned by major.minor only (e.g. 6.12) and
+          # stores the per-flavour config xz-compressed, e.g.
+          # /usr/src/linux-config-6.12/config.amd64_none_amd64.xz
+          KMAJMIN="$(printf '%s' "${ABI}" | cut -d. -f1,2)"
+          mkdir -p /tmp/pkgcfg
+          if apt-get download "linux-config-${KMAJMIN}"; then
+            dpkg-deb -x linux-config-"${KMAJMIN}"_*.deb /tmp/pkgcfg
+            BASE="$(find /tmp/pkgcfg/usr/src -name 'config.amd64_none_amd64.xz' | head -n1)"
+            test -s "${BASE}"
+            xz -dc "${BASE}" > config
+          else
+            apt-get download "linux-image-${ABI}"
+            dpkg-deb -x linux-image-"${ABI}"_*.deb /tmp/pkgcfg
+            BASE="$(find /tmp/pkgcfg/boot -maxdepth 1 -name 'config-*' | head -n1)"
+            test -s "${BASE}"
+            cp "${BASE}" config
+          fi
+          test -s config
+          rm -rf /tmp/pkgcfg
+
+          # ------------------------------------------------------------------
+          # Layer the OGC config fragments and the repo-local config.fragment
+          # (which wins). kernel-packages ships no debian-specific fragments.
+          # Order is critical: unsets apply first, then sets, so explicit
+          # enables can override explicit disables.
+          # ------------------------------------------------------------------
+          for f in ogc.config.set ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash ./merge-fragments.sh config \
+              ogc.config.unset \
+              ogc.config.set \
+              config.fragment
+          echo "Config after fragment merge (head):"
+          head -n 3 config
+
+      - name: Ensure pahole >= 1.31 (sched_ext/BTF)
+        run: |
+          set -euxo pipefail
+          VER="$(pahole --version | tr -d 'v')"
+          MAJ="${VER%%.*}"; MIN="${VER#*.}"; MIN="${MIN%%.*}"
+          echo "Installed pahole: ${VER}"
+          if [ "$MAJ" -lt 1 ] || { [ "$MAJ" -eq 1 ] && [ "$MIN" -lt 31 ]; }; then
+            echo "pahole < 1.31 breaks sched_ext; building dwarves 1.31 from source"
+            apt-get install -y --no-install-recommends cmake pkg-config
+            cd /tmp
+            curl -fsSLO https://fedorapeople.org/~acme/dwarves/dwarves-1.31.tar.xz
+            echo "0a7f255ccacf8cc7f8cd119099eb327179b4b3c67cb015af646af6d0cb03054d  dwarves-1.31.tar.xz" | sha256sum -c
+            tar -xf dwarves-1.31.tar.xz
+            cmake -B dwarves-1.31/build -S dwarves-1.31 \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+            make -C dwarves-1.31/build -j"$(nproc)" install
+          fi
+          pahole --version
+
+      - name: Build .deb packages with the in-tree packaging
+        run: |
+          set -euxo pipefail
+          mkdir -p /build
+          tar -xzf /tmp/stage/linux.tar.gz -C /build
+          cd /build/linux
+
+          # Config adjustments + kernel release suffix, identical scheme to
+          # the Arch and Fedora packages (uname -r == ${KREL}).
+          cp /tmp/stage/config .config
+          # Debian's config references distro-only certificate files that do
+          # not exist in this tree; use the ephemeral in-tree key instead.
+          scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+          # CONFIG_MODULE_SIG_KEY points at the Debian signing cert, which
+          # does not exist in this tree. Reset it to the kbuild default
+          # ("certs/signing_key.pem"): an ephemeral self-signed key generated
+          # during the build and trusted by the kernel itself. The Debian
+          # config sets CONFIG_MODULE_SIG_ALL=y, and with an empty key string
+          # scripts/Makefile.modinst resolves sig-key to "./", making
+          # sign-file read a directory as the private key (SSL DECODER error)
+          # on every module.
+          scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+          scripts/config -u DEFAULT_HOSTNAME
+          scripts/config --set-str BUILD_SALT "${KREL}"
+          echo "-unstable-ogc-g${SHA8}" > localversion.10-pkgname
+          echo "-1" > localversion.20-pkgrel
+          # The staged tarball carries no VCS data, but mkdebian (via
+          # gen-diff-patch) runs "git diff HEAD" and aborts on failure.
+          # A throwaway repo with everything committed makes that a no-op.
+          git init -q
+          git config user.email "ci@opengamingcollective.org"
+          git config user.name "OpenGamingCollective CI"
+          git add -A
+          git commit -qm "linux-unstable-ogc ${KREL}"
+          chown -R builder:builder /build
+
+          # scripts/setlocalversion appends a "+" whenever a git repo exists
+          # and LOCALVERSION is unset and the HEAD is not at an annotated
+          # version tag. The throwaway repo below would therefore corrupt the
+          # release string. Setting LOCALVERSION to the empty string (as
+          # documented in the script) suppresses that suffix everywhere.
+          runuser -u builder -- env HOME=/home/builder CCACHE_DIR=/ccache \
+            LOCALVERSION= \
+            make CC="ccache clang" LLVM=1 LLVM_IAS=1 WERROR=0 \
+            KBUILD_BUILD_HOST=ogc-ci KBUILD_BUILD_USER=kernel-unstable-ogc \
+            olddefconfig
+
+          # Fail fast if the release string ever drifts from the other distros
+          REL="$(runuser -u builder -- env HOME=/home/builder LOCALVERSION= make -s kernelrelease)"
+          if [ "$REL" != "${KREL}" ]; then
+            echo "kernelrelease '$REL' does not match expected '${KREL}'" >&2
+            exit 1
+          fi
+
+          # Generate the debian/ directory with the tree's own packaging.
+          # mkdebian is invoked directly as a script: a bare "make debian" is
+          # NOT a top-level make target in this tree (only *-pkg patterns are
+          # delegated to scripts/Makefile.package), and going through make
+          # without the exact same CC flags as the olddefconfig above made
+          # kbuild re-sync the config interactively. As a plain sh script it
+          # touches nothing kbuild-related.
+          # KDEB_PKGVERSION must not contain hyphens except the final revision
+          # separator (Debian policy), hence the dotted translation.
+          KDEBVER="${KVERDOT}.unstable.ogc.g${SHA8}-1"
+          runuser -u builder -- env HOME=/home/builder \
+            srctree="$PWD" \
+            ARCH=x86_64 SRCARCH=x86 UTS_MACHINE=x86_64 \
+            KERNELRELEASE="${KREL}" \
+            KCONFIG_CONFIG=.config \
+            KDEB_SOURCENAME=linux-unstable-ogc \
+            KDEB_PKGVERSION="${KDEBVER}" \
+            KDEB_CHANGELOG_DIST=trixie \
+            DEBFULLNAME="OpenGamingCollective CI" \
+            DEBEMAIL="ci@opengamingcollective.org" \
+            sh scripts/package/mkdebian
+          echo "debian arch: $(cat debian/arch)"
+
+          # Kbuild only honours command-line variables, so inject the
+          # clang/ccache toolchain into the generated debian/rules (this is
+          # what "make bindeb-pkg" would otherwise lose). LOCALVERSION= (set,
+          # empty) keeps setlocalversion from appending "+" inside the build.
+          sed -i 's|^make-opts = |make-opts = CC="ccache clang" LLVM=1 LLVM_IAS=1 WERROR=0 LOCALVERSION= KBUILD_BUILD_HOST=ogc-ci KBUILD_BUILD_USER=kernel-unstable-ogc |' debian/rules
+          grep -n '^make-opts' debian/rules
+
+          # Same invocation as "make bindeb-pkg" (scripts/Makefile.package),
+          # but with parallel jobs, --no-check-builddeps (the build deps are
+          # preinstalled above; the generated Build-Depends-Arch also names a
+          # distro-only cross-gcc package that need not exist), and without
+          # the multi-GB debug-symbol package (all other distro jobs ship no
+          # debug packages either).
+          runuser -u builder -- env HOME=/home/builder CCACHE_DIR=/ccache \
+            LOCALVERSION= \
+            DEB_BUILD_PROFILES="pkg.linux-unstable-ogc.nokerneldbg" \
+            dpkg-buildpackage --build=binary --no-pre-clean --unsigned-changes \
+            --no-check-builddeps \
+            -R'make -f debian/rules' -j"$(nproc)" -a"$(cat debian/arch)"
+
+          ls -lh /build/*.deb
+
+      - name: Collect Debian artifacts
+        run: |
+          set -euxo pipefail
+          DISTDIR=/tmp/dist
+          mkdir -p "${DISTDIR}"
+          cp -v "/build/linux-image-${KREL}"_*.deb "${DISTDIR}/"
+          cp -v "/build/linux-headers-${KREL}"_*.deb "${DISTDIR}/"
+          cp -v /build/linux/.config "${DISTDIR}/config-debian-${KREL}"
+          # linux-libc-dev is intentionally NOT shipped: installing it would
+          # replace the distribution's own linux-libc-dev package.
+          ls -lh "${DISTDIR}"
+
+      - name: Clean build tree (free disk before cache save)
+        run: rm -rf /build ; df -h /
+
+      - name: Upload Debian packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: debian-packages
+          path: /tmp/dist
+          retention-days: 3
+
+  release:
+    name: Create GitHub release
+    needs: [prepare, arch, fedora, debian]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      KREL: ${{ needs.prepare.outputs.krel }}
+      KVER: ${{ needs.prepare.outputs.kver }}
+      NEXT: ${{ needs.prepare.outputs.next }}
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/dist
+          pattern: "*-packages"
+
+      - name: Flatten artifact directory
+        run: |
+          set -euxo pipefail
+          cd /tmp/dist
+          find . -mindepth 2 -maxdepth 2 -type f -exec mv -t . {} +
+          find . -mindepth 1 -type d -delete
+          ls -lh
+
+      - name: Generate checksums
+        run: |
+          set -euxo pipefail
+          cd /tmp/dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+
+          # Idempotency: if a stale release exists for this tag (e.g. re-run
+          # of the same commit), remove it so this run can recreate it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
+            echo "Deleting existing release $TAG, will recreate it"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          # In case a tag without a release is left over, drop it too.
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
+
+          NOTES="$(mktemp)"
+          {
+            echo "Automated build of linux-unstable-ogc."
+            echo
+            echo "- Source commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "- Kernel release: ${KREL}"
+            echo "- Upstream version: ${KVER}${NEXT}"
+            echo "- Base configs: Arch \`linux-headers\` + Fedora \`kernel-core\`, plus [OGC kernel-packages fragments](${KERNEL_PACKAGES_RAW}/config)"
+            echo "- Compiler: clang / LLVM=1 (with ccache)"
+            echo
+            echo "### Artifacts"
+            echo
+            echo "#### Arch Linux"
+            echo
+            echo '- `linux-unstable-ogc` — kernel image and modules'
+            echo '- `linux-unstable-ogc-headers` — headers for building external modules'
+            echo "- \`config-arch-${KREL}\` — the exact .config used for this build"
+            echo
+            echo "#### Fedora"
+            echo
+            echo '- `kernel-unstable-ogc-core` — kernel image (vmlinuz) and core files'
+            echo '- `kernel-unstable-ogc-modules` — kernel modules'
+            echo '- `kernel-unstable-ogc-devel` — headers for building external modules'
+            echo "- \`config-fedora-${KREL}\` — the exact .config used for this build"
+            echo
+            echo "#### Debian (and derivatives)"
+            echo
+            echo "- \`linux-image-${KREL}\` — kernel image and modules"
+            echo "- \`linux-headers-${KREL}\` — headers for building external modules"
+            echo "- \`config-debian-${KREL}\` — the exact .config used for this build"
+            echo
+            echo '- `SHA256SUMS` — checksums of all artifacts'
+            echo
+            echo "### Install"
+            echo
+            echo "Arch Linux:"
+            echo
+            echo '```sh'
+            echo 'sudo pacman -U linux-unstable-ogc-headers-*.pkg.tar.zst linux-unstable-ogc-*.pkg.tar.zst'
+            echo '```'
+            echo
+            echo "Fedora:"
+            echo
+            echo '```sh'
+            echo 'sudo dnf install ./kernel-unstable-ogc-core-*.rpm ./kernel-unstable-ogc-modules-*.rpm'
+            echo '```'
+            echo
+            echo "Debian and derivatives:"
+            echo
+            echo '```sh'
+            echo 'sudo apt install ./linux-image-*.deb ./linux-headers-*.deb'
+            echo '```'
+            echo
+            echo "> The initramfs is generated automatically on install (mkinitcpio hooks"
+            echo "> on Arch, kernel-install/dracut on Fedora, initramfs-tools hooks on Debian)."
+          } > "$NOTES"
+
+          cd /tmp/dist
+          # Upload every artifact produced by the distro jobs (package files
+          # plus the config-* files). SHA256SUMS itself is included by ./*.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "linux-unstable-ogc ${KREL}" \
+            --notes-file "$NOTES" \
+            ./*
+
+      - name: Summary
+        run: |
+          {
+            echo "## linux-unstable-ogc build"
+            echo
+            echo "- Kernel release: \`${KREL}\`"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
