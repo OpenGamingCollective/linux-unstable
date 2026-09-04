@@ -72,6 +72,7 @@ jobs:
           cp .github/packaging/merge-fragments.sh   "${STAGE}/merge-fragments.sh"
           cp .github/packaging/config.fragment      "${STAGE}/config.fragment"
           cp .github/packaging/fedora/kernel.spec   "${STAGE}/kernel.spec"
+          cp .github/packaging/boot-smoke-test.sh   "${STAGE}/boot-smoke-test.sh"
 
           # Source tarball: contents of the repo as ./linux/, without VCS data.
           tar --exclude-vcs -I 'gzip -1' -cf "${STAGE}/linux.tar.gz" \
@@ -196,6 +197,24 @@ jobs:
           cp -v ./*.pkg.tar.zst "${DISTDIR}/"
           # Ship the exact .config used for the build as well
           cp -v "src/linux/.config" "${DISTDIR}/config-arch-${KREL}"
+
+      - name: Boot smoke test in QEMU (release gate)
+        run: |
+          set -euxo pipefail
+          pacman -S --needed --noconfirm qemu-system-x86 edk2-ovmf
+          # ----------------------------------------------------------------
+          # Boot the exact kernel image that ships in the package. This
+          # step fails the job (and with it the release) if the kernel
+          # panics, hangs or never reaches userspace, so an unbootable
+          # kernel is never uploaded or published.
+          # ----------------------------------------------------------------
+          WORK=/tmp/bootsmoke
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          PKG="$(find /tmp/dist -name 'linux-unstable-ogc-*.pkg.tar.zst' ! -name '*-headers-*' | head -n1)"
+          test -n "$PKG"
+          tar --zstd -xf "$PKG" -C "$WORK" "usr/lib/modules/${KREL}/vmlinuz"
+          test -s "$WORK/usr/lib/modules/${KREL}/vmlinuz"
+          bash /tmp/stage/boot-smoke-test.sh "$WORK/usr/lib/modules/${KREL}/vmlinuz"
 
       - name: Clean build tree (free disk before cache save)
         run: rm -rf "${PKGDIR}/src" "${PKGDIR}/pkg" ; df -h /
@@ -347,6 +366,27 @@ jobs:
           cp -v /tmp/rpmbuild/RPMS/x86_64/*.rpm "${DISTDIR}/"
           cp -v /tmp/stage/config "${DISTDIR}/config-fedora-${KREL}"
           ls -lh "${DISTDIR}"
+
+      - name: Boot smoke test in QEMU (release gate)
+        run: |
+          set -euxo pipefail
+          dnf -y install qemu-system-x86 edk2-ovmf
+          # ----------------------------------------------------------------
+          # Boot the exact kernel image that ships in the kernel-core RPM.
+          # This step fails the job (and with it the release) if the kernel
+          # panics, hangs or never reaches userspace, so an unbootable
+          # kernel is never uploaded or published.
+          # ----------------------------------------------------------------
+          WORK=/tmp/bootsmoke
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          RPM="$(find /tmp/dist -name 'kernel-unstable-ogc-core-*.rpm' | head -n1)"
+          test -n "$RPM"
+          # rpm cpio entries are stored with a "./" prefix (same trick as
+          # the config extraction above).
+          rpm2cpio "$RPM" | cpio -idm --quiet -D "$WORK" "./lib/modules/${KREL}/vmlinuz" || true
+          IMG="$WORK/lib/modules/${KREL}/vmlinuz"
+          test -s "$IMG" || { echo "::error::vmlinuz not found inside ${RPM}"; exit 1; }
+          bash /tmp/stage/boot-smoke-test.sh "$IMG"
 
       - name: Clean build tree (free disk before cache save)
         run: rm -rf /tmp/rpmbuild/BUILD /tmp/rpmbuild/BUILDROOT ; df -h /
@@ -588,6 +628,28 @@ jobs:
           # replace the distribution's own linux-libc-dev package.
           ls -lh "${DISTDIR}"
 
+      - name: Boot smoke test in QEMU (release gate)
+        run: |
+          set -euxo pipefail
+          apt-get update -qq
+          # qemu boots the kernel (OVMF provides the UEFI leg); cpio builds
+          # the test initramfs.
+          apt-get install -y --no-install-recommends qemu-system-x86 cpio ovmf
+          # ----------------------------------------------------------------
+          # Boot the exact kernel image that ships in the linux-image .deb.
+          # This step fails the job (and with it the release) if the kernel
+          # panics, hangs or never reaches userspace, so an unbootable
+          # kernel is never uploaded or published.
+          # ----------------------------------------------------------------
+          WORK=/tmp/bootsmoke
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          DEB="$(find /tmp/dist -name "linux-image-${KREL}_*.deb" | head -n1)"
+          test -n "$DEB"
+          dpkg-deb -x "$DEB" "$WORK"
+          IMG="$(find "$WORK" -name 'vmlinuz-*' -type f | head -n1)"
+          test -n "$IMG"
+          bash /tmp/stage/boot-smoke-test.sh "$IMG"
+
       - name: Clean build tree (free disk before cache save)
         run: rm -rf /build ; df -h /
 
@@ -653,6 +715,7 @@ jobs:
             echo "- Upstream version: ${KVER}${NEXT}"
             echo "- Base configs: Arch \`linux-headers\` + Fedora \`kernel-core\`, plus [OGC kernel-packages fragments](${KERNEL_PACKAGES_RAW}/config)"
             echo "- Compiler: clang / LLVM=1 (with ccache)"
+            echo "- Boot smoke test: every packaged kernel (Arch, Fedora, Debian) was booted in QEMU and reached userspace init before publishing"
             echo
             echo "### Artifacts"
             echo
@@ -718,4 +781,5 @@ jobs:
             echo
             echo "- Kernel release: \`${KREL}\`"
             echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            echo "- QEMU boot smoke test: passed (Arch, Fedora and Debian kernel images booted to userspace init)"
           } >> "$GITHUB_STEP_SUMMARY"
