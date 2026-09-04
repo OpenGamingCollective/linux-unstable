@@ -44,38 +44,16 @@ jobs:
           # ------------------------------------------------------------------
           # Find the upstream snapshot that master's fork commits sit on.
           #
-          # linux-next is rebuilt from scratch every day: commits merged into
-          # yesterday's tree are regularly dropped from today's history
-          # (subsystem trees get rebased), so:
-          #   - "upstream/master..master" contains hundreds of unrelated
-          #     upstream commits, not just our fork commits, and
-          #   - a hardcoded marker hash gets orphaned by the very replay this
-          #     workflow performs (run #2 then dies with "unknown revision",
-          #     which is how this workflow broke in the first place).
-          #
-          # Anchor: walk first-parent history from master and stop at the
-          # second consecutive commit whose subject does not start with
-          # "ogc:" (the reserved prefix of every fork commit; cherry-pick
-          # preserves subjects, so this survives replays and force-pushes).
-          # The first of those two commits is the upstream snapshot the fork
-          # was built on.
+          # Anchor: the empty marker commit "ogc: linux-unstable: first
+          # commit" is always the first fork commit ever made. Its parent is
+          # therefore the upstream snapshot the fork was built on.
           # ------------------------------------------------------------------
-          BASE=""
-          NONOGC=""
-          while read -r c; do
-            case "$(git show -s --format=%s "$c")" in
-              ogc:*) NONOGC="" ;;
-                *)
-                  if [ -n "$NONOGC" ]; then BASE="$NONOGC"; break; fi
-                  NONOGC="$c"
-                  ;;
-            esac
-          done < <(git rev-list --first-parent master)
-
-          if [ -z "$BASE" ]; then
-            echo "::error::Could not determine the upstream base of the fork; refusing to touch master."
+          MARKER="$(git log --format="%H" --grep="^ogc: linux-unstable: first commit$" master)"
+          if [ -z "$MARKER" ]; then
+            echo "::error::Could not find the 'ogc: linux-unstable: first commit' marker; refusing to touch master."
             exit 1
           fi
+          BASE="$(git rev-parse "${MARKER}^")"
           echo "Upstream base: $(git show -s --oneline "$BASE")"
 
           # If master already sits on the current upstream tip there is
