@@ -46,6 +46,17 @@ config LEDS_CLASS_MULTICOLOR
 	  for multicolor LEDs that are grouped together. This class is not
 	  intended for single color LEDs. It can be built as a module.
 
+config LEDS_CLASS_DYNAMIC
+	tristate "LED Dynamic Lighting Class Support"
+	depends on LEDS_CLASS
+	help
+	  This option enables support for the Dynamic Lighting LED class in
+	  /sys/class/leds. It wraps the LED class and adds dynamic lighting
+	  attributes (per-key RGB streaming, 2D matrix controls, hardware
+	  animation effects, and power state persistence).
+
+	  It can be built as a module.
+
 config LEDS_BRIGHTNESS_HW_CHANGED
 	bool "LED Class brightness_hw_changed attribute support"
 	depends on LEDS_CLASS

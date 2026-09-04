@@ -14831,6 +14831,14 @@ S:	Supported
 F:	Documentation/scsi/leapraid.rst
 F:	drivers/scsi/leapraid/
 
+LED DYNAMIC LIGHTING CLASS
+M:	Marco Scardovi <scardracs@disroot.org>
+M:	Denis Benato <denis.benato@linux.dev>
+L:	linux-leds@vger.kernel.org
+S:	Maintained
+F:	drivers/leds/led-class-dynamic.c
+F:	include/linux/led-dynamic-lighting.h
+
 LED SUBSYSTEM
 M:	Lee Jones <lee@kernel.org>
 M:	Pavel Machek <pavel@kernel.org>
