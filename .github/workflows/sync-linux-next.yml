@@ -53,24 +53,12 @@ jobs:
           #     workflow performs (run #2 then dies with "unknown revision",
           #     which is how this workflow broke in the first place).
           #
-          # Anchor: walk first-parent history from master and stop at the
-          # second consecutive commit whose subject does not start with
-          # "ogc:" (the reserved prefix of every fork commit; cherry-pick
-          # preserves subjects, so this survives replays and force-pushes).
-          # The first of those two commits is the upstream snapshot the fork
-          # was built on.
+          # Anchor: linux-next daily releases always finish with a release
+          # commit titled "Add linux-next specific files for YYYYMMDD".
+          # We search master's first-parent history for the latest such
+          # commit to reliably identify the upstream base.
           # ------------------------------------------------------------------
-          BASE=""
-          NONOGC=""
-          while read -r c; do
-            case "$(git show -s --format=%s "$c")" in
-              ogc:*) NONOGC="" ;;
-                *)
-                  if [ -n "$NONOGC" ]; then BASE="$NONOGC"; break; fi
-                  NONOGC="$c"
-                  ;;
-            esac
-          done < <(git rev-list --first-parent master)
+          BASE="$(git log --first-parent --grep="^Add linux-next specific files for " -n 1 --format="%H" master)"
 
           if [ -z "$BASE" ]; then
             echo "::error::Could not determine the upstream base of the fork; refusing to touch master."
@@ -104,7 +92,7 @@ jobs:
           # corrupting master.
           N="$(echo "$MY_COMMITS" | wc -l)"
           if [ "$N" -gt 150 ]; then
-            echo "::error::Refusing to replay ${N} commits (expected only fork commits). Check master's history (all fork commits must carry the 'ogc:' subject prefix)."
+            echo "::error::Refusing to replay ${N} commits (expected only fork commits). Check master's history."
             exit 1
           fi
 
