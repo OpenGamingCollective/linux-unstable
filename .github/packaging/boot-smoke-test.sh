@@ -34,6 +34,10 @@
 #                "Linux version <KREL>" must appear on every console log.
 #          BOOT_SMOKE_TIMEOUT  override the per-boot timeout in seconds
 #                              (default: 300 under KVM, 1200 under TCG).
+# The kernel command line pins loglevel=7: some distro configs default the
+# console to a quieter level (Arch ships CONSOLE_LOGLEVEL_DEFAULT=4), which
+# would suppress the KERN_NOTICE boot banner and make the banner check below
+# fail on an otherwise perfectly bootable kernel.
 # Requires (installed by the calling CI job): qemu-system-x86_64, cpio,
 #          gzip, a C compiler (gcc or clang), an OVMF build for the UEFI
 #          leg (packages: ovmf / edk2-ovmf), coreutils (timeout, find).
@@ -190,7 +194,7 @@ run_boot() {
 		-display none -monitor none -no-reboot \
 		-serial "file:$serial" \
 		-kernel "$IMAGE" -initrd "$WORK/initrd.img" \
-		-append "console=ttyS0,115200n8 rdinit=/init panic=-1 nokaslr" \
+		-append "console=ttyS0,115200n8 rdinit=/init panic=-1 nokaslr loglevel=7" \
 		|| true
 	# A panic with panic=-1 reboots instantly and -no-reboot makes QEMU
 	# exit, so both "qemu exited by itself" and "timeout killed it" end up
@@ -205,7 +209,12 @@ run_boot() {
 	fi
 	if [ -n "${KREL:-}" ] && ! grep -qF "Linux version ${KREL} " "$serial"; then
 		echo "::error::QEMU boot smoke test FAILED in the '$name' configuration: the booted kernel banner does not advertise release '${KREL}'."
-		grep -m1 "^Linux version" "$serial" || true
+		# Show what the console actually carried: log lines carry a
+		# "[    0.000000] " timestamp prefix, so anchor-free context of
+		# the early console output is what makes this diagnosable.
+		echo "----- first 25 lines of the $name guest serial console -----"
+		head -n 25 "$serial" | sed 's/\r$//'
+		echo "-------------------------------------------------------------"
 		exit 1
 	fi
 	echo "[$name] Boot smoke test PASSED: kernel booted to userspace init and powered off. Serial console tail:"
