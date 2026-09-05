@@ -1,0 +1,101 @@
+What:		/sys/class/leds/<led>/zone_type
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read
+		The physical topology of this lighting zone. Outputs one of:
+		- "generic"
+		- "keyboard_per_key"
+		- "matrix_2d"
+		- "segment_strip"
+		- "logo"
+		- "lightbar"
+
+What:		/sys/class/leds/<led>/led_count
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read
+		Total number of individual, addressable LEDs in this zone.
+
+What:		/sys/class/leds/<led>/matrix_dimensions
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read
+		Width and height of 2D matrix zones formatted as two
+		space-separated integers ("<width> <height>"). This attribute
+		is only visible for zones with zone_type "matrix_2d".
+
+What:		/sys/class/leds/<led>/effects_supported
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read
+		Space-separated list of animation effects supported by the
+		hardware or driver. Possible effect names include:
+		"off", "static", "breathing", "strobe", "spectrum_cycle",
+		"rainbow", "direct", and "custom".
+
+What:		/sys/class/leds/<led>/effect
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read/write
+		Current active hardware effect. Reading outputs the effect name.
+		Writing an effect name from effects_supported selects that
+		effect. Any active trigger is automatically detached upon
+		switching effects to prevent lock conflicts.
+
+What:		/sys/class/leds/<led>/effect_speed
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read/write
+		Current animation speed level (integer between 0 and max_speed).
+		Only visible when the driver supports adjustable speed.
+
+What:		/sys/class/leds/<led>/effect_direction
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read/write
+		Animation propagation direction. Outputs or accepts one of:
+		"left", "right", "up", "down", "clockwise", "counter_clockwise".
+		Only visible when the driver supports directional animations.
+
+What:		/sys/class/leds/<led>/effects_palette
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read/write
+		Multi-color stacked palette used by multi-color animation effects.
+		Reading outputs space-separated 24-bit hex colors ("#RRGGBB").
+		Writing accepts a space-separated sequence of hex triplets.
+		The number of entries must not exceed max_palette_entries.
+
+What:		/sys/class/leds/<led>/power_states_supported
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read
+		Space-separated list of system power states supported for
+		lighting persistence ("boot", "awake", "sleep", "shutdown").
+		Only visible on devices supporting power state configuration.
+
+What:		/sys/class/leds/<led>/power_states
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	read/write
+		Space-separated list of currently enabled persistence power
+		states. Writing a space-separated list of state names
+		idempotently updates active states.
+		Only visible on devices supporting power state configuration.
+
+What:		/sys/class/leds/<led>/direct_buffer
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	write-only (binary)
+		Raw packed RGB stream (3 bytes per LED: R, G, B in sequence).
+		Writing to this node transmits direct per-key or matrix frame data
+		bypassing hardware effect generators. The buffer size must exactly
+		match (led_count * 3) bytes.
+
+What:		/sys/class/leds/<led>/frame
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Description:	write-only (binary)
+		Raw binary sink for monochrome pixel displays (e.g. AniMe Matrix)
+		or segment lighting strips. Dispatches chunks directly to the
+		hardware driver.
