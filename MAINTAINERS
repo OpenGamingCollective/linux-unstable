@@ -11759,6 +11759,15 @@ F:	include/linux/pm.h
 F:	include/linux/suspend.h
 F:	kernel/power/
 
+HID ASUS DRIVERS
+M:	Marco Scardovi <scardracs@disroot.org>
+M:	Denis Benato <denis.benato@linux.dev>
+L:	linux-input@vger.kernel.org
+S:	Maintained
+W:	https://asus-linux.org/
+F:	Documentation/ABI/testing/sysfs-class-led-driver-hid-asus
+F:	drivers/hid/hid-asus.c
+
 HID CORE LAYER
 M:	Jiri Kosina <jikos@kernel.org>
 M:	Benjamin Tissoires <bentiss@kernel.org>
