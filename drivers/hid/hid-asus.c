@@ -37,6 +37,8 @@ MODULE_AUTHOR("Yusuke Fujimaki <usk.fujimaki@gmail.com>");
 MODULE_AUTHOR("Brendan McGrath <redmcg@redmandi.dyndns.org>");
 MODULE_AUTHOR("Victor Vlasenko <victor.vlasenko@sysgears.com>");
 MODULE_AUTHOR("Frederik Wenigwieser <frederik.wenigwieser@gmail.com>");
+MODULE_AUTHOR("Marco Scardovi <scardracs@disroot.org>");
+MODULE_AUTHOR("Denis Benato <denis.benato@linux.dev>");
 MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 
 #define T100_TPAD_INTF 2
@@ -50,6 +52,31 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define FEATURE_KBD_REPORT_SIZE 64
 #define FEATURE_KBD_LED_REPORT_ID1 0x5d
 #define FEATURE_KBD_LED_REPORT_ID2 0x5e
+
+/*
+ * Microsoft HID Lighting Illumination / LampArray (Usage Page 0x59).
+ *
+ * Linux Dynamic Lighting (led-class-dynamic / aura:*) is the userspace ABI.
+ * On some Strix N-KEY devices (e.g. G614PR) Aura feature 0xBC cannot address
+ * the chassis lightbar independently; the sibling LampArray interface is the
+ * correct direct-RGB backend (same path Windows DL / G-Helper LampArray use).
+ * When LampArray is absent, callers fall back to Aura 0xBC. Firmware effects
+ * (0xb3) remain on the Aura report ID 0x5d interface.
+ *
+ * The LampArray USB interface is bound without hidraw so lighting stays
+ * exclusively under this driver.
+ */
+#define ASUS_LAMPARRAY_MAX_LAMPS	64
+#define ASUS_LAMPARRAY_MULTI_MAX	8
+#define ASUS_LAMPARRAY_PURPOSE_CONTROL	0x01
+#define ASUS_LAMPARRAY_FLAG_COMPLETE	0x01
+#define ASUS_LAMPARRAY_RID_ATTR		0x01
+#define ASUS_LAMPARRAY_RID_REQUEST	0x02
+#define ASUS_LAMPARRAY_RID_RESPONSE	0x03
+#define ASUS_LAMPARRAY_RID_MULTI	0x04
+#define ASUS_LAMPARRAY_RID_CONTROL	0x06
+#define AURA_ZONE_ACTIVATE_LAMPARRAY	0x03
+#define AURA_ZONE_RELEASE_LAMPARRAY	0x04
 
 #define ROG_ALLY_REPORT_SIZE 64
 #define ROG_ALLY_X_MIN_MCU 313
@@ -939,6 +966,34 @@ static bool asus_has_report_id(struct hid_device *hdev, u16 report_id)
 	return false;
 }
 
+
+/*
+ * Sibling USB interface with HID Lighting (LampArray) only — no Aura 0x5d.
+ * Bound by this driver without hidraw so lighting stays in-kernel DL.
+ */
+static int asus_lamparray_detect_base(struct hid_device *hdev)
+{
+	u8 base;
+
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
+	    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return -ENODEV;
+
+	for (base = 0; base <= 0x40; base += 0x40) {
+		if (asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_ATTR) &&
+		    asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_MULTI) &&
+		    asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_CONTROL))
+			return base;
+	}
+
+	return -ENODEV;
+}
+
+static bool asus_is_lamparray_interface(struct hid_device *hdev)
+{
+	return asus_lamparray_detect_base(hdev) >= 0;
+}
+
 static int asus_kbd_register_leds(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -1474,6 +1529,18 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
+	/*
+	 * USB 0x193b is reused by AniMe Matrix. Bind only LampArray or
+	 * interfaces that expose Aura/Slash LED reports.
+	 */
+	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
+	    !asus_is_lamparray_interface(hdev) &&
+	    !asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) &&
+	    !asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
+		hid_dbg(hdev, "Skipping 0x193b without Aura/Slash LED reports\n");
+		return -ENODEV;
+	}
+
 	/* Check for vendor for RGB init and handle generic devices properly. */
 	rep_enum = &hdev->report_enum[HID_INPUT_REPORT];
 	list_for_each_entry(rep, &rep_enum->report_list, list) {
@@ -1488,6 +1555,21 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	 */
 	if (is_vendor && (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD))
 		hdev->quirks |= HID_QUIRK_HIDINPUT_FORCE;
+
+	/*
+	 * LampArray is a Dynamic Lighting backend owned in-kernel: do not
+	 * export hidraw for that interface. Aura 0xBC remains the fallback
+	 * when LampArray is absent.
+	 */
+	if (asus_is_lamparray_interface(hdev)) {
+		ret = hid_hw_start(hdev, 0);
+		if (ret) {
+			hid_err(hdev, "Asus LampArray hw start failed: %d\n", ret);
+			return ret;
+		}
+		hid_info(hdev, "Bound ASUS LampArray interface (no hidraw)\n");
+		return 0;
+	}
 
 	ret = asus_worker_create(hdev, drvdata);
 	if (ret) {
@@ -1561,6 +1643,11 @@ static void asus_remove(struct hid_device *hdev)
 
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
+
+	if (asus_is_lamparray_interface(hdev)) {
+		hid_hw_stop(hdev);
+		return;
+	}
 
 	asus_worker_stop(drvdata->worker);
 	hid_hw_stop(hdev);
@@ -1698,6 +1785,9 @@ static const struct hid_device_id asus_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+	    USB_DEVICE_ID_ASUSTEK_ROG_SLASH),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD2),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
