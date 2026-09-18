@@ -305,6 +305,11 @@ struct asus_lamparray_lamp {
 
 struct asus_drvdata {
 	unsigned long quirks;
+	struct led_classdev slash_led;
+	bool has_slash_led;
+	u8 slash_mode;
+	u8 slash_brightness;
+	u8 slash_interval;
 	struct hid_device *hdev;
 	struct input_dev *input;
 	struct input_dev *tp_kbd_input;
@@ -1176,6 +1181,22 @@ static bool asus_is_lamparray_interface(struct hid_device *hdev)
 {
 	return asus_lamparray_detect_base(hdev) >= 0;
 }
+
+/*
+ * Slash is identified by HID feature reports, never DMI board lists:
+ * - report 0x5e is the dedicated Slash feature report on Aura keyboards
+ * - standalone Slash MCU reuses USB 0x193b (also AniMe) and talks over 0x5d
+ *   when 0x5e is absent; AniMe is rejected earlier because it has neither
+ */
+static bool asus_device_has_slash(struct hid_device *hdev)
+{
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return true;
+
+	return hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
+	       asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1);
+}
+
 static int asus_kbd_register_leds(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -2608,6 +2629,264 @@ static int asus_aura_discover(struct asus_drvdata *drvdata, bool *has_lightbar,
 	return 0;
 }
 
+static const struct asus_slash_mode {
+	const char *name;
+	u8 mode;
+} asus_slash_modes[] = {
+	{ "Static", 0x06 },
+	{ "Bounce", 0x10 },
+	{ "Slash", 0x12 },
+	{ "Loading", 0x13 },
+	{ "BitStream", 0x1d },
+	{ "Transmission", 0x1a },
+	{ "Flow", 0x19 },
+	{ "Flux", 0x25 },
+	{ "Phantom", 0x24 },
+	{ "Spectrum", 0x26 },
+	{ "Hazard", 0x32 },
+	{ "Interfacing", 0x33 },
+	{ "Ramp", 0x34 },
+	{ "GameOver", 0x42 },
+	{ "Start", 0x43 },
+	{ "Buzzer", 0x44 },
+};
+
+static inline u8 asus_slash_report_id(struct asus_drvdata *drvdata)
+{
+	if (asus_has_report_id(drvdata->hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return FEATURE_KBD_LED_REPORT_ID2;
+	return FEATURE_KBD_LED_REPORT_ID1;
+}
+
+static int asus_slash_init_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd7, 0x00, 0x00, 0x01, 0xac };
+	u8 pkt2[] = { rpt, 0xd2, 0x02, 0x01, 0x08, 0xab };
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_set_options_unlocked(struct asus_drvdata *drvdata, bool enabled,
+					  u8 brightness, u8 interval)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = {
+		rpt, 0xd3, 0x03, 0x01, 0x08, 0xab, 0xff, 0x01,
+		enabled ? 1 : 0, 0x06, brightness, 0xff, interval
+	};
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_set_mode_unlocked(struct asus_drvdata *drvdata, u8 mode)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd2, 0x03, 0x00, 0x0c };
+	u8 pkt2[] = {
+		rpt, 0xd3, 0x04, 0x00, 0x0c, 0x01, mode, 0x02,
+		0x19, 0x03, 0x13, 0x04, 0x11, 0x05, 0x12, 0x06, 0x13
+	};
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_save_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = { rpt, 0xd4, 0x00, 0x00, 0x01, 0xab };
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_brightness_set_blocking(struct led_classdev *led_cdev,
+					      enum led_brightness brightness)
+{
+	struct asus_drvdata *drvdata = container_of(led_cdev, struct asus_drvdata, slash_led);
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_brightness = brightness;
+	ret = asus_slash_set_options_unlocked(drvdata, brightness > 0, (u8)brightness,
+					     drvdata->slash_interval);
+	if (ret < 0)
+		return ret;
+
+	return asus_slash_save_unlocked(drvdata);
+}
+
+static ssize_t slash_mode_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (asus_slash_modes[i].mode == drvdata->slash_mode)
+			return sysfs_emit(buf, "%s\n", asus_slash_modes[i].name);
+	}
+
+	return sysfs_emit(buf, "0x%02x\n", drvdata->slash_mode);
+}
+
+static ssize_t slash_mode_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	char mode_str[32];
+	unsigned int i;
+	u8 mode_val = 0;
+	int ret;
+
+	if (sscanf(buf, "%31s", mode_str) != 1)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (sysfs_streq(mode_str, asus_slash_modes[i].name)) {
+			mode_val = asus_slash_modes[i].mode;
+			break;
+		}
+	}
+
+	if (!mode_val) {
+		if (kstrtou8(mode_str, 0, &mode_val))
+			return -EINVAL;
+	}
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	ret = asus_slash_set_mode_unlocked(drvdata, mode_val);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	drvdata->slash_mode = mode_val;
+	return count;
+}
+static DEVICE_ATTR_RW(slash_mode);
+
+static ssize_t slash_mode_index_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf,
+			  "Static Bounce Slash Loading BitStream Transmission Flow Flux Phantom Spectrum Hazard Interfacing Ramp GameOver Start Buzzer\n");
+}
+static DEVICE_ATTR_RO(slash_mode_index);
+
+static ssize_t slash_interval_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+
+	return sysfs_emit(buf, "%u\n", drvdata->slash_interval);
+}
+
+static ssize_t slash_interval_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	u8 interval;
+	int ret;
+
+	if (kstrtou8(buf, 0, &interval))
+		return -EINVAL;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_interval = interval;
+	ret = asus_slash_set_options_unlocked(drvdata, drvdata->slash_brightness > 0,
+					     drvdata->slash_brightness, interval);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(slash_interval);
+
+static struct attribute *asus_slash_attrs[] = {
+	&dev_attr_slash_mode.attr,
+	&dev_attr_slash_mode_index.attr,
+	&dev_attr_slash_interval.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_slash_group = {
+	.attrs = asus_slash_attrs,
+};
+
+static const struct attribute_group *asus_slash_groups[] = {
+	&asus_slash_group,
+	NULL,
+};
+
+static int asus_init_slash(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	int ret;
+
+	if (!asus_device_has_slash(hdev))
+		return 0;
+
+	drvdata->slash_led.name = "asus::slash";
+	drvdata->slash_led.max_brightness = 255;
+	drvdata->slash_led.brightness = 255;
+	drvdata->slash_led.brightness_set_blocking = asus_slash_brightness_set_blocking;
+	drvdata->slash_led.groups = asus_slash_groups;
+
+	drvdata->slash_brightness = 255;
+	drvdata->slash_interval = 0;
+	drvdata->slash_mode = 0x19;
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_slash_init_unlocked(drvdata);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to initialize Slash lighting: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = devm_led_classdev_register(&hdev->dev, &drvdata->slash_led);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register Slash LED classdev: %d\n", ret);
+		return ret;
+	}
+
+	drvdata->has_slash_led = true;
+	hid_info(hdev, "Registered Slash lighting LED: asus::slash\n");
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		asus_slash_set_options_unlocked(drvdata, true, 255, 0);
+		asus_slash_set_mode_unlocked(drvdata, 0x19);
+		asus_slash_save_unlocked(drvdata);
+	}
+
+	return 0;
+}
+
 static void asus_aura_dldev_set_default_palette(struct led_classdev_dynamic *ldev)
 {
 	if (!ldev->palette)
@@ -2793,6 +3072,11 @@ static int asus_init_dynamic_lighting(struct hid_device *hdev)
 #else /* !IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC) */
 
 static inline int asus_init_dynamic_lighting(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static inline int asus_init_slash(struct hid_device *hdev)
 {
 	return 0;
 }
@@ -3394,6 +3678,10 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		ret = asus_init_dynamic_lighting(hdev);
 		if (ret < 0)
 			hid_warn(hdev, "Failed to initialize dynamic lighting: %d\n", ret);
+
+		ret = asus_init_slash(hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to initialize Slash lighting: %d\n", ret);
 	}
 
 	/*
