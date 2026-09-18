@@ -296,6 +296,11 @@ enum asus_aura_mode {
 	AURA_MODE_MAX,
 };
 
+struct asus_lamparray_lamp {
+	u16 id;
+	s32 x;
+	bool keyboard;
+};
 #endif
 
 struct asus_drvdata {
@@ -331,6 +336,14 @@ struct asus_drvdata {
 	enum asus_aura_mode aura_mode;
 	u8 kbd_direct_buf[ROG_STRIX_4ZONE_KBD_BUF_SIZE];
 	u8 lb_direct_buf[ROG_STRIX_LIGHTBAR_BUF_SIZE];
+	struct hid_device *lamparray_hdev;
+	u8 *lamparray_buf;
+	size_t lamparray_buf_len;
+	u8 lamparray_rid_base;
+	unsigned int lamparray_count;
+	bool lamparray_controlled;
+	bool lamparray_unavailable;
+	struct asus_lamparray_lamp *lamparray_lamps;
 #endif
 };
 
@@ -1543,6 +1556,322 @@ static int asus_aura_write_zone_effect(struct asus_drvdata *drvdata, u8 zone,
 	return 0;
 }
 
+static size_t asus_lamparray_report_len(struct hid_device *hdev, u8 id)
+{
+	struct hid_report *report;
+
+	report = hdev->report_enum[HID_FEATURE_REPORT].report_id_hash[id];
+	if (!report)
+		return 0;
+	return hid_report_len(report);
+}
+
+static u8 asus_lamparray_rid(struct asus_drvdata *drvdata, u8 offset)
+{
+	return drvdata->lamparray_rid_base + offset;
+}
+
+static int asus_lamparray_raw(struct asus_drvdata *drvdata, u8 *buf, size_t len,
+			      bool get)
+{
+	int ret;
+
+	if (!drvdata->lamparray_hdev || !len)
+		return -ENODEV;
+
+	ret = hid_hw_raw_request(drvdata->lamparray_hdev, buf[0], buf, len,
+				 HID_FEATURE_REPORT,
+				 get ? HID_REQ_GET_REPORT : HID_REQ_SET_REPORT);
+	return ret < 0 ? ret : 0;
+}
+
+static void asus_lamparray_prepare(struct asus_drvdata *drvdata, u8 rid)
+{
+	memset(drvdata->lamparray_buf, 0, drvdata->lamparray_buf_len);
+	drvdata->lamparray_buf[0] = rid;
+}
+
+static struct hid_device *asus_find_lamparray_sibling(struct hid_device *hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	struct usb_host_config *config;
+	unsigned int i;
+
+	if (!hid_is_usb(hdev))
+		return NULL;
+
+	intf = to_usb_interface(hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+	if (!udev->actconfig)
+		return NULL;
+
+	config = udev->actconfig;
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *other = config->interface[i];
+		struct hid_device *other_hdev;
+
+		if (!other || other == intf)
+			continue;
+		if (!other->dev.driver || other->dev.driver != intf->dev.driver)
+			continue;
+
+		other_hdev = usb_get_intfdata(other);
+		if (!other_hdev)
+			continue;
+		if (other_hdev->vendor != hdev->vendor ||
+		    other_hdev->product != hdev->product)
+			continue;
+		if (asus_is_lamparray_interface(other_hdev))
+			return other_hdev;
+	}
+
+	return NULL;
+}
+
+static void asus_lamparray_unbind_from_owners(struct hid_device *la_hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	struct usb_host_config *config;
+	unsigned int i;
+
+	if (!hid_is_usb(la_hdev))
+		return;
+
+	intf = to_usb_interface(la_hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+	if (!udev->actconfig)
+		return;
+
+	config = udev->actconfig;
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *other = config->interface[i];
+		struct hid_device *other_hdev;
+		struct asus_drvdata *owner;
+
+		if (!other || other == intf)
+			continue;
+		if (!other->dev.driver || other->dev.driver != intf->dev.driver)
+			continue;
+
+		other_hdev = usb_get_intfdata(other);
+		if (!other_hdev || other_hdev->driver != la_hdev->driver)
+			continue;
+
+		owner = hid_get_drvdata(other_hdev);
+		if (!owner)
+			continue;
+
+		mutex_lock(&owner->aura_lock);
+		if (owner->lamparray_hdev == la_hdev) {
+			owner->lamparray_controlled = false;
+			owner->lamparray_count = 0;
+			owner->lamparray_lamps = NULL;
+			owner->lamparray_hdev = NULL;
+			owner->lamparray_unavailable = true;
+			mutex_unlock(&owner->aura_lock);
+			put_device(&la_hdev->dev);
+			return;
+		}
+		mutex_unlock(&owner->aura_lock);
+	}
+}
+
+static int asus_lamparray_cmp_x(const void *a, const void *b)
+{
+	const struct asus_lamparray_lamp *la = a;
+	const struct asus_lamparray_lamp *lb = b;
+
+	return cmp_int(la->x, lb->x);
+}
+
+static int asus_lamparray_init_from_hdev(struct asus_drvdata *drvdata,
+					 struct hid_device *la_hdev)
+{
+	u8 *buf;
+	size_t attr_len, req_len, resp_len, multi_len, ctrl_len, max_len;
+	unsigned int count, i;
+	int base, ret;
+
+	base = asus_lamparray_detect_base(la_hdev);
+	if (base < 0)
+		return base;
+
+	attr_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_ATTR);
+	req_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_REQUEST);
+	resp_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_RESPONSE);
+	multi_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_MULTI);
+	ctrl_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_CONTROL);
+	max_len = max3(max(attr_len, req_len), max(resp_len, multi_len), ctrl_len);
+	if (attr_len < 3 || req_len < 3 || resp_len < 23 || multi_len < 51 ||
+	    ctrl_len < 2 || !max_len)
+		return -EPROTO;
+
+	buf = devm_kzalloc(&drvdata->hdev->dev, max_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	drvdata->lamparray_hdev = la_hdev;
+	drvdata->lamparray_buf = buf;
+	drvdata->lamparray_buf_len = max_len;
+	drvdata->lamparray_rid_base = base;
+
+	asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_ATTR);
+	ret = asus_lamparray_raw(drvdata, buf, attr_len, true);
+	if (ret < 0)
+		return ret;
+
+	count = get_unaligned_le16(buf + 1);
+	if (!count || count > ASUS_LAMPARRAY_MAX_LAMPS)
+		return -EPROTO;
+
+	drvdata->lamparray_lamps = devm_kcalloc(&drvdata->hdev->dev, count,
+						sizeof(*drvdata->lamparray_lamps),
+						GFP_KERNEL);
+	if (!drvdata->lamparray_lamps)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		u32 purposes;
+
+		asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_REQUEST);
+		put_unaligned_le16(i, buf + 1);
+		ret = asus_lamparray_raw(drvdata, buf, req_len, false);
+		if (ret < 0)
+			return ret;
+
+		asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_RESPONSE);
+		ret = asus_lamparray_raw(drvdata, buf, resp_len, true);
+		if (ret < 0)
+			return ret;
+
+		/* LampId@1, PositionX@3, LampPurposes@19 (HID Lighting) */
+		drvdata->lamparray_lamps[i].id = get_unaligned_le16(buf + 1);
+		drvdata->lamparray_lamps[i].x = (s32)get_unaligned_le32(buf + 3);
+		purposes = get_unaligned_le32(buf + 19);
+		drvdata->lamparray_lamps[i].keyboard =
+			!!(purposes & ASUS_LAMPARRAY_PURPOSE_CONTROL);
+	}
+
+	drvdata->lamparray_count = count;
+	sort(drvdata->lamparray_lamps, count, sizeof(*drvdata->lamparray_lamps),
+	     asus_lamparray_cmp_x, NULL);
+	get_device(&la_hdev->dev);
+	hid_info(drvdata->hdev,
+		 "LampArray direct RGB backend (%u lamps, rid_base=0x%02x)\n",
+		 count, base);
+	return 0;
+}
+
+static void asus_lamparray_try_init_unlocked(struct asus_drvdata *drvdata)
+{
+	struct hid_device *sibling;
+	int ret;
+
+	if (drvdata->lamparray_count || drvdata->lamparray_unavailable)
+		return;
+
+	sibling = asus_find_lamparray_sibling(drvdata->hdev);
+	if (!sibling)
+		return;
+
+	ret = asus_lamparray_init_from_hdev(drvdata, sibling);
+	if (ret < 0) {
+		hid_warn(drvdata->hdev, "LampArray init failed: %d\n", ret);
+		drvdata->lamparray_hdev = NULL;
+		drvdata->lamparray_lamps = NULL;
+		drvdata->lamparray_count = 0;
+		drvdata->lamparray_unavailable = true;
+	}
+}
+
+static int asus_lamparray_set_control_unlocked(struct asus_drvdata *drvdata,
+					       bool autonomous)
+{
+	u8 rid = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_CONTROL);
+	size_t len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid);
+
+	if (len < 2)
+		return -EPROTO;
+
+	asus_lamparray_prepare(drvdata, rid);
+	drvdata->lamparray_buf[1] = autonomous ? 0x01 : 0x00;
+	return asus_lamparray_raw(drvdata, drvdata->lamparray_buf, len, false);
+}
+
+static int asus_lamparray_aura_handoff_unlocked(struct asus_drvdata *drvdata,
+						u8 zone, bool release)
+{
+	u8 aura[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_ZONE_ENABLE,
+		zone,
+		0x01,
+	};
+
+	if (release)
+		aura[4] = 0x01;
+
+	return asus_aura_set_feature_unlocked(drvdata, aura, sizeof(aura));
+}
+
+static int asus_lamparray_take_control_unlocked(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	if (drvdata->lamparray_controlled)
+		return 0;
+
+	ret = asus_lamparray_aura_handoff_unlocked(drvdata,
+						   AURA_ZONE_ACTIVATE_LAMPARRAY,
+						   false);
+	if (ret < 0)
+		return ret;
+
+	/* Match G-Helper: pulse then clear AutonomousMode for host control */
+	ret = asus_lamparray_set_control_unlocked(drvdata, true);
+	if (ret < 0)
+		return ret;
+	ret = asus_lamparray_set_control_unlocked(drvdata, false);
+	if (ret < 0)
+		return ret;
+
+	drvdata->lamparray_controlled = true;
+	return 0;
+}
+
+static void asus_lamparray_release_unlocked(struct asus_drvdata *drvdata)
+{
+	if (!drvdata->lamparray_count || !drvdata->lamparray_controlled)
+		return;
+
+	asus_lamparray_set_control_unlocked(drvdata, true);
+	asus_lamparray_aura_handoff_unlocked(drvdata,
+					     AURA_ZONE_RELEASE_LAMPARRAY,
+					     true);
+	drvdata->lamparray_controlled = false;
+}
+
+static void asus_lamparray_sample_rgb(const u8 *buf, unsigned int nleds,
+				      unsigned int idx, unsigned int n,
+				      u8 *r, u8 *g, u8 *b)
+{
+	unsigned int zi;
+
+	if (!buf || !nleds || !n) {
+		*r = *g = *b = 0;
+		return;
+	}
+
+	zi = (idx * nleds) / n;
+	if (zi >= nleds)
+		zi = nleds - 1;
+	*r = buf[zi * 3];
+	*g = buf[zi * 3 + 1];
+	*b = buf[zi * 3 + 2];
+}
+
 static void asus_lamparray_fill_solid(u8 *buf, unsigned int nleds,
 				      u8 r, u8 g, u8 b)
 {
@@ -1569,21 +1898,80 @@ static void asus_aura_init_direct_bufs(struct asus_drvdata *drvdata)
 				  asus_aura_lb_led_count(drvdata), 255, 0, 0);
 }
 
+static int asus_lamparray_apply_unlocked(struct asus_drvdata *drvdata)
+{
+	unsigned int kbd_n = 0, lb_n = 0, kbd_i = 0, lb_i = 0, i;
+	unsigned int kbd_leds = ROG_STRIX_4ZONE_KBD_LEDS;
+	unsigned int lb_leds = asus_aura_lb_led_count(drvdata);
+	u8 *buf = drvdata->lamparray_buf;
+	u8 rid_multi = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_MULTI);
+	size_t multi_len;
+	int ret;
 
+	ret = asus_lamparray_take_control_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < drvdata->lamparray_count; i++) {
+		if (drvdata->lamparray_lamps[i].keyboard)
+			kbd_n++;
+		else
+			lb_n++;
+	}
+
+	multi_len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid_multi);
+	if (multi_len < 51)
+		return -EPROTO;
+
+	for (i = 0; i < drvdata->lamparray_count; i += ASUS_LAMPARRAY_MULTI_MAX) {
+		unsigned int n = min_t(unsigned int, ASUS_LAMPARRAY_MULTI_MAX,
+				       drvdata->lamparray_count - i);
+		unsigned int j;
+		unsigned int id_off = 3;
+		unsigned int col_off = 3 + ASUS_LAMPARRAY_MULTI_MAX * 2;
+
+		asus_lamparray_prepare(drvdata, rid_multi);
+		buf[1] = n;
+		buf[2] = (i + n >= drvdata->lamparray_count) ?
+			 ASUS_LAMPARRAY_FLAG_COMPLETE : 0;
+
+		for (j = 0; j < n; j++) {
+			unsigned int lamp = i + j;
+			u8 r, g, b;
+			u16 id = drvdata->lamparray_lamps[lamp].id;
+
+			if (drvdata->lamparray_lamps[lamp].keyboard) {
+				asus_lamparray_sample_rgb(drvdata->kbd_direct_buf,
+							  kbd_leds, kbd_i++, kbd_n,
+							  &r, &g, &b);
+			} else {
+				asus_lamparray_sample_rgb(drvdata->lb_direct_buf,
+							  lb_leds, lb_i++, lb_n,
+							  &r, &g, &b);
+			}
+
+			put_unaligned_le16(id, buf + id_off + j * 2);
+			buf[col_off + j * 4 + 0] = r;
+			buf[col_off + j * 4 + 1] = g;
+			buf[col_off + j * 4 + 2] = b;
+			buf[col_off + j * 4 + 3] = 0xff;
+		}
+
+		ret = asus_lamparray_raw(drvdata, buf, multi_len, false);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* Prefer LampArray; callers keep Aura 0xBC as fallback on -ENODEV. */
 static int asus_lamparray_try_apply_unlocked(struct asus_drvdata *drvdata)
 {
-	return -ENODEV;
-}
-
-static void asus_lamparray_release_unlocked(struct asus_drvdata *drvdata)
-{
-}
-
-static int asus_lamparray_apply_solid_unlocked(struct asus_drvdata *drvdata,
-					       struct led_classdev_dynamic *ldev,
-					       u8 r, u8 g, u8 b)
-{
-	return -ENODEV;
+	asus_lamparray_try_init_unlocked(drvdata);
+	if (!drvdata->lamparray_count)
+		return -ENODEV;
+	return asus_lamparray_apply_unlocked(drvdata);
 }
 
 static int asus_aura_write_4zone_direct_bc_unlocked(struct asus_drvdata *drvdata)
@@ -1681,6 +2069,30 @@ static bool asus_aura_is_lightbar(struct asus_drvdata *drvdata,
 				  struct led_classdev_dynamic *ldev)
 {
 	return ldev == &drvdata->dldev_lightbar;
+}
+
+static int asus_lamparray_apply_solid_unlocked(struct asus_drvdata *drvdata,
+					       struct led_classdev_dynamic *ldev,
+					       u8 r, u8 g, u8 b)
+{
+	unsigned int lb_leds = asus_aura_lb_led_count(drvdata);
+
+	asus_lamparray_try_init_unlocked(drvdata);
+	if (!drvdata->lamparray_count)
+		return -ENODEV;
+
+	if (asus_aura_is_global(drvdata, ldev)) {
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf,
+					  ROG_STRIX_4ZONE_KBD_LEDS, r, g, b);
+		asus_lamparray_fill_solid(drvdata->lb_direct_buf, lb_leds, r, g, b);
+	} else if (asus_aura_is_lightbar(drvdata, ldev)) {
+		asus_lamparray_fill_solid(drvdata->lb_direct_buf, lb_leds, r, g, b);
+	} else {
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf,
+					  ROG_STRIX_4ZONE_KBD_LEDS, r, g, b);
+	}
+
+	return asus_lamparray_apply_unlocked(drvdata);
 }
 
 static int asus_aura_write_zone_range(struct asus_drvdata *drvdata,
@@ -1962,7 +2374,9 @@ static int asus_aura_apply_effect(struct led_classdev_dynamic *ldev,
 			if (ret != -ENODEV)
 				return ret;
 		} else {
-			asus_lamparray_release_unlocked(drvdata);
+			asus_lamparray_try_init_unlocked(drvdata);
+			if (drvdata->lamparray_count)
+				asus_lamparray_release_unlocked(drvdata);
 		}
 	}
 
@@ -2268,7 +2682,11 @@ static int asus_init_dynamic_lighting(struct hid_device *hdev)
 	if (ret < 0)
 		hid_warn(hdev, "Failed to wake Aura hardware zones: %d\n", ret);
 
-	kbd_direct = is_per_key || drvdata->is_strix_4zone;
+	scoped_guard(mutex, &drvdata->aura_lock)
+		asus_lamparray_try_init_unlocked(drvdata);
+
+	kbd_direct = is_per_key || drvdata->is_strix_4zone ||
+		     drvdata->lamparray_hdev != NULL;
 	lightbar_direct = has_lightbar;
 	ret = asus_aura_get_effect_mask(drvdata, effect_mask);
 	if (ret < 0) {
@@ -2924,6 +3342,7 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (is_vendor && (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD))
 		hdev->quirks |= HID_QUIRK_HIDINPUT_FORCE;
 
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
 	/*
 	 * LampArray is a Dynamic Lighting backend owned in-kernel: do not
 	 * export hidraw for that interface. Aura 0xBC remains the fallback
@@ -2938,6 +3357,7 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		hid_info(hdev, "Bound ASUS LampArray interface (no hidraw)\n");
 		return 0;
 	}
+#endif
 
 	ret = asus_worker_create(hdev, drvdata);
 	if (ret) {
@@ -3019,10 +3439,23 @@ static void asus_remove(struct hid_device *hdev)
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
 
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
 	if (asus_is_lamparray_interface(hdev)) {
+		asus_lamparray_unbind_from_owners(hdev);
 		hid_hw_stop(hdev);
 		return;
 	}
+	if (drvdata->lamparray_hdev) {
+		scoped_guard(mutex, &drvdata->aura_lock) {
+			asus_lamparray_release_unlocked(drvdata);
+			if (drvdata->lamparray_hdev) {
+				put_device(&drvdata->lamparray_hdev->dev);
+				drvdata->lamparray_hdev = NULL;
+			}
+			drvdata->lamparray_count = 0;
+		}
+	}
+#endif
 
 	asus_worker_stop(drvdata->worker);
 	hid_hw_stop(hdev);
