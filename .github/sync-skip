@@ -1,0 +1,11 @@
+# Subjects of fork commits that must not be replayed. Upstream already has
+# a newer version: a cherry-pick would conflict, or apply and duplicate code.
+# One full subject per line. Empty lines and lines starting with # are ignored.
+# After a successful sync those commits are gone, so unmatched lines do nothing.
+[FROM-ML] drm/amd/display: Add 2.1 FreeSync support for AMD VSDB EDID Block
+[FROM-ML] drm/edid: parse HDMI 2.1 gaming (ALLM/VRR) capabilities from HF-VSDB
+[FROM-ML] drm/amd/display: Add HDMI 2.1 VRR support from HF-VSDB
+[FROM-ML] drm/amd/display: Enable HDMI ALLM for Gaming-VRR
+[FROM-ML] iommu/amd: Add PerfOpt IOMMU performance optimization support
+[FROM-ML] drm/amdgpu: Enable PerfOpt IOMMU perf optimization when GPU in identity domain
+[FROM-ML] HID: asus: do not send keyboard init reports to touchpads

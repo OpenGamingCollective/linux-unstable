@@ -86,6 +86,22 @@ jobs:
             exit 1
           fi
 
+          # Read before reset: the replay checks out upstream and the file
+          # is gone until its own commit is cherry-picked back.
+          SKIP_SUBJECTS=""
+          if [ -f .github/sync-skip ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                ''|\#*) continue ;;
+              esac
+              SKIP_SUBJECTS="${SKIP_SUBJECTS}"$'\n'"${line}"
+            done < .github/sync-skip
+          fi
+
+          # Patch-ids equivalent to something already in linux-next. Limited
+          # to the fork range so the daily job does not hash all of history.
+          EQUIV_UPSTREAM="$(git cherry -v "$UP_BASE" master "$BASE" | awk '$1 == "-" { print $2 }')"
+
           echo "Replaying ${N} commit(s):"
           for c in $MY_COMMITS; do
             echo "  $c  $(git show -s --format=%s "$c")"
@@ -95,21 +111,65 @@ jobs:
           # Reset master to the new upstream tip, then replay the fork commits.
           git reset --hard "$UP_BASE"
 
-          for c in $MY_COMMITS; do
-            echo "Cherry-picking: $c  $(git show -s --format=%s "$c")"
+          subject_skipped() {
+            local subj="$1" line
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              [ "$line" = "$subj" ] && return 0
+            done <<< "$SKIP_SUBJECTS"
+            return 1
+          }
 
-            if ! git cherry-pick -x --allow-empty "$c"; then
-              git status || true
-              # If we're left mid-cherry-pick, abort to avoid a broken
-              # working state. Nothing was pushed, so master on origin is
-              # still intact.
-              if [ -f .git/CHERRY_PICK_HEAD ]; then
-                git cherry-pick --abort || true
-              fi
-              echo "::error::Cherry-pick failed for $c; nothing was pushed."
-              exit 1
+          for c in $MY_COMMITS; do
+            subj="$(git show -s --format=%s "$c")"
+
+            if subject_skipped "$subj"; then
+              echo "Skipping $c (listed in .github/sync-skip): $subj"
+              continue
             fi
+
+            case " $EQUIV_UPSTREAM " in
+              *" $c "*)
+                echo "Skipping $c (equivalent patch already in linux-next): $subj"
+                continue
+                ;;
+            esac
+
+            echo "Cherry-picking: $c  $subj"
+
+            if git cherry-pick -x --allow-empty --empty=drop "$c"; then
+              continue
+            fi
+
+            # --empty=drop did not consume it. An empty result is already upstream.
+            if [ -f .git/CHERRY_PICK_HEAD ] &&
+               git diff --quiet && git diff --cached --quiet; then
+              echo "Cherry-pick of $c is empty; skipping."
+              git cherry-pick --skip
+              continue
+            fi
+
+            echo "::group::Cherry-pick failed for $c"
+            echo "$subj"
+            git diff --name-only --diff-filter=U || true
+            git status || true
+            echo "::endgroup::"
+            if [ -f .git/CHERRY_PICK_HEAD ]; then
+              git cherry-pick --abort || true
+            fi
+            echo "::error::Cherry-pick failed for $c ($subj); nothing was pushed."
+            exit 1
           done
+
+          NEW_MARKER="$(git log --format="%H" --grep="^ogc: linux-unstable: first commit$" HEAD)"
+          if [ -z "$NEW_MARKER" ]; then
+            echo "::error::Replay dropped the 'ogc: linux-unstable: first commit' marker; nothing was pushed."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$UP_BASE" HEAD; then
+            echo "::error::Replay result does not contain upstream/master; nothing was pushed."
+            exit 1
+          fi
 
           echo "Done. Pushing updated master."
           git push --force-with-lease origin master
