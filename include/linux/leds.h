@@ -110,6 +110,7 @@ struct led_classdev {
 #define LED_REJECT_NAME_CONFLICT BIT(24)
 #define LED_MULTI_COLOR		BIT(25)
 #define LED_TRIG_HW_CHANGED	BIT(26)
+#define LED_DYNAMIC_LIGHTING	BIT(27)
 
 	/* set_brightness_work / blink_timer flags, atomic, private. */
 	unsigned long		work_flags;
@@ -162,6 +163,14 @@ struct led_classdev {
 
 	struct device		*dev;
 	const struct attribute_group	**groups;
+
+	/*
+	 * Back-pointer to a Dynamic Lighting extension, if any. Set by
+	 * led_classdev_dynamic_register() for both standalone devices and
+	 * drop-in attach onto an existing LED. Typed as void * so leds.h
+	 * does not depend on led-dynamic-lighting.h.
+	 */
+	void			*led_dynamic;
 
 	struct list_head	 node;			/* LED Device list */
 	const char		*default_trigger;	/* Trigger to use */

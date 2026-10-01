@@ -11759,6 +11759,15 @@ F:	include/linux/pm.h
 F:	include/linux/suspend.h
 F:	kernel/power/
 
+HID ASUS DRIVERS
+M:	Marco Scardovi <scardracs@disroot.org>
+M:	Denis Benato <denis.benato@linux.dev>
+L:	linux-input@vger.kernel.org
+S:	Maintained
+W:	https://asus-linux.org/
+F:	Documentation/ABI/testing/sysfs-class-led-driver-hid-asus
+F:	drivers/hid/hid-asus.c
+
 HID CORE LAYER
 M:	Jiri Kosina <jikos@kernel.org>
 M:	Benjamin Tissoires <bentiss@kernel.org>
@@ -14994,6 +15003,16 @@ L:	linux-scsi@vger.kernel.org
 S:	Supported
 F:	Documentation/scsi/leapraid.rst
 F:	drivers/scsi/leapraid/
+
+LED DYNAMIC LIGHTING CLASS
+M:	Marco Scardovi <scardracs@disroot.org>
+M:	Denis Benato <denis.benato@linux.dev>
+L:	linux-leds@vger.kernel.org
+S:	Maintained
+F:	Documentation/ABI/testing/sysfs-class-leds-dynamic
+F:	Documentation/leds/leds-class-dynamic.rst
+F:	drivers/leds/led-class-dynamic.c
+F:	include/linux/led-dynamic-lighting.h
 
 LED SUBSYSTEM
 M:	Lee Jones <lee@kernel.org>

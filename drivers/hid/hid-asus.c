@@ -30,6 +30,10 @@
 #include <linux/usb.h> /* For to_usb_interface for T100 touchpad intf check */
 #include <linux/power_supply.h>
 #include <linux/leds.h>
+#include <linux/led-dynamic-lighting.h>
+#include <linux/sort.h>
+#include <linux/string.h>
+#include <linux/unaligned.h>
 
 #include "hid-ids.h"
 
@@ -37,6 +41,8 @@ MODULE_AUTHOR("Yusuke Fujimaki <usk.fujimaki@gmail.com>");
 MODULE_AUTHOR("Brendan McGrath <redmcg@redmandi.dyndns.org>");
 MODULE_AUTHOR("Victor Vlasenko <victor.vlasenko@sysgears.com>");
 MODULE_AUTHOR("Frederik Wenigwieser <frederik.wenigwieser@gmail.com>");
+MODULE_AUTHOR("Marco Scardovi <scardracs@disroot.org>");
+MODULE_AUTHOR("Denis Benato <denis.benato@linux.dev>");
 MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 
 #define T100_TPAD_INTF 2
@@ -51,9 +57,137 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define FEATURE_KBD_LED_REPORT_ID1 0x5d
 #define FEATURE_KBD_LED_REPORT_ID2 0x5e
 
-#define ROG_ALLY_REPORT_SIZE 64
-#define ROG_ALLY_X_MIN_MCU 313
-#define ROG_ALLY_MIN_MCU 319
+#define AURA_FEATURE_REPORT_SIZE	64
+#define ASUS_AURA_MAX_EFFECTS		13
+
+#define AURA_CMD_PROBE			0x05
+#define AURA_CMD_RUN_MODE		0x9e
+#define AURA_CMD_SET_EFFECT		0xb3
+#define AURA_CMD_COMMIT			0xb4
+#define AURA_CMD_SET			0xb5
+#define AURA_CMD_ZONE_ENABLE	0xc0
+#define AURA_CMD_DIRECT			0xbc
+#define AURA_CMD_POWER			0xbd
+
+#define AURA_ZONE_ACTIVATE_KEYBOARD	0x00
+#define AURA_ZONE_ACTIVATE_LIGHTBAR	0x01
+
+#define AURA_POWER_CMD_ENABLE		0x01
+
+/* Power Byte 0: Logo (even bits) & Keyboard (odd bits) */
+#define AURA_POWER_LOGO_BOOT		BIT(0)
+#define AURA_POWER_KBD_BOOT			BIT(1)
+#define AURA_POWER_LOGO_AWAKE		BIT(2)
+#define AURA_POWER_KBD_AWAKE		BIT(3)
+#define AURA_POWER_LOGO_SLEEP		BIT(4)
+#define AURA_POWER_KBD_SLEEP		BIT(5)
+#define AURA_POWER_LOGO_SHUTDOWN	BIT(6)
+#define AURA_POWER_KBD_SHUTDOWN	BIT(7)
+#define AURA_POWER_MASK_LOGO_ALL	(AURA_POWER_LOGO_BOOT | \
+					 AURA_POWER_LOGO_AWAKE | \
+					 AURA_POWER_LOGO_SLEEP | \
+					 AURA_POWER_LOGO_SHUTDOWN)
+#define AURA_POWER_MASK_KBD_LOGO_ALL	0xff
+
+/* Power Byte 1: Chassis Lightbar */
+#define AURA_POWER_LB_AUX		BIT(0)
+#define AURA_POWER_LB_BOOT		BIT(1)
+#define AURA_POWER_LB_AWAKE		BIT(2)
+#define AURA_POWER_LB_SLEEP		BIT(3)
+#define AURA_POWER_LB_SHUTDOWN		BIT(4)
+#define AURA_POWER_MASK_LIGHTBAR_ALL	0x1f
+
+/* Power Byte 2: Lid Display Bezel / Lid segments */
+#define AURA_POWER_LID_BOOT			BIT(0)
+#define AURA_POWER_LID_AWAKE		BIT(1)
+#define AURA_POWER_LID_SLEEP		BIT(2)
+#define AURA_POWER_LID_SHUTDOWN		BIT(3)
+#define AURA_POWER_LID_PERSISTENCE	0xd0
+#define AURA_POWER_MASK_LID_ALL		(AURA_POWER_LID_PERSISTENCE | 0x0f)
+
+/* Power Byte 3: Rear Glow */
+#define AURA_POWER_REAR_BOOT		BIT(0)
+#define AURA_POWER_REAR_AWAKE		BIT(1)
+#define AURA_POWER_REAR_SLEEP		BIT(2)
+#define AURA_POWER_REAR_SHUTDOWN	BIT(3)
+#define AURA_POWER_MASK_REAR_ALL	0x0f
+
+#define AURA_ZONE_ALL			0x00
+#define AURA_ZONE_KEY1			0x01
+#define AURA_ZONE_KEY2			0x02
+#define AURA_ZONE_KEY3			0x03
+#define AURA_ZONE_KEY4			0x04
+#define AURA_ZONE_LOGO			0x05
+#define AURA_ZONE_BAR_LEFT		0x06
+#define AURA_ZONE_BAR_RIGHT		0x07
+#define AURA_ZONE_KEYBOARD_CHANNEL	0x01
+#define AURA_ZONE_LIGHTBAR_CHANNEL	0x04
+
+#define AURA_EFFECT_STATIC		0x00
+#define AURA_EFFECT_BREATHING		0x01
+#define AURA_EFFECT_SPECTRUM_CYCLE	0x02
+#define AURA_EFFECT_RAINBOW		0x03
+#define AURA_EFFECT_STARS			0x04
+#define AURA_EFFECT_RAIN			0x05
+#define AURA_EFFECT_REACTIVE		0x06
+#define AURA_EFFECT_LASER			0x07
+#define AURA_EFFECT_RIPPLE		0x08
+#define AURA_EFFECT_PULSE			0x0a
+#define AURA_EFFECT_COMET			0x0b
+#define AURA_EFFECT_FLASH			0x0c
+
+#define AURA_SPEED_SLOW			0xe1
+#define AURA_SPEED_MED			0xeb
+#define AURA_SPEED_FAST			0xf5
+
+#define ROG_STRIX_LEDS_PER_PKT		16
+#define ROG_STRIX_PERKEY_FULL_PKTS	10
+#define ROG_STRIX_PERKEY_FINAL_PKT_LEDS	8
+#define ROG_STRIX_PERKEY_PACKETS	(ROG_STRIX_PERKEY_FULL_PKTS + 1)
+#define ROG_STRIX_DIRECT_LEDS \
+	((ROG_STRIX_PERKEY_FULL_PKTS * ROG_STRIX_LEDS_PER_PKT) + \
+	 ROG_STRIX_PERKEY_FINAL_PKT_LEDS)
+#define ROG_STRIX_DIRECT_BUF_SIZE	(ROG_STRIX_DIRECT_LEDS * 3)
+#define ROG_STRIX_LIGHTBAR_LEDS		12
+#define ROG_STRIX_LIGHTBAR_BUF_SIZE	(ROG_STRIX_LIGHTBAR_LEDS * 3)
+#define ROG_STRIX_4ZONE_KBD_LEDS	4
+#define ROG_STRIX_4ZONE_KBD_BUF_SIZE	(ROG_STRIX_4ZONE_KBD_LEDS * 3)
+#define ROG_STRIX_4ZONE_LIGHTBAR_LEDS	6
+#define ROG_STRIX_4ZONE_LIGHTBAR_BUF_SIZE \
+					(ROG_STRIX_4ZONE_LIGHTBAR_LEDS * 3)
+#define ROG_STRIX_4ZONE_DIRECT_KBD_OFFSET	9
+#define ROG_STRIX_4ZONE_DIRECT_LB_OFFSET	27
+#define ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET	9
+
+#define AURA_DIRECT_FRAME_PERKEY	0x00
+#define AURA_DIRECT_FRAME_ZONED		0x01
+#define AURA_DIRECT_ROUTING_DEFAULT	0x01
+#define AURA_DIRECT_CHUNK_FLAG		0x01
+
+/*
+ * Microsoft HID Lighting Illumination / LampArray (Usage Page 0x59).
+ *
+ * Linux Dynamic Lighting (led-class-dynamic / aura:*) is the userspace ABI.
+ * On some Strix N-KEY devices (e.g. G614PR) Aura feature 0xBC cannot address
+ * the chassis lightbar independently; the sibling LampArray interface is the
+ * correct direct-RGB backend (same path Windows DL / G-Helper LampArray use).
+ * When LampArray is absent, callers fall back to Aura 0xBC. Firmware effects
+ * (0xb3) remain on the Aura report ID 0x5d interface.
+ *
+ * The LampArray USB interface is bound without hidraw so lighting stays
+ * exclusively under this driver.
+ */
+#define ASUS_LAMPARRAY_MAX_LAMPS	64
+#define ASUS_LAMPARRAY_MULTI_MAX	8
+#define ASUS_LAMPARRAY_PURPOSE_CONTROL	0x01
+#define ASUS_LAMPARRAY_FLAG_COMPLETE	0x01
+#define ASUS_LAMPARRAY_RID_ATTR		0x01
+#define ASUS_LAMPARRAY_RID_REQUEST	0x02
+#define ASUS_LAMPARRAY_RID_RESPONSE	0x03
+#define ASUS_LAMPARRAY_RID_MULTI	0x04
+#define ASUS_LAMPARRAY_RID_CONTROL	0x06
+#define AURA_ZONE_ACTIVATE_LAMPARRAY	0x03
+#define AURA_ZONE_RELEASE_LAMPARRAY	0x04
 
 /* Spurious HID codes sent by QUIRK_ROG_NKEY_KEYBOARD devices */
 #define ASUS_SPURIOUS_CODE_0XEA 0xea
@@ -154,8 +288,28 @@ struct asus_touchpad_info {
 	int report_size;
 };
 
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+enum asus_aura_mode {
+	AURA_MODE_AUTO = 0,
+	AURA_MODE_UNIFIED,
+	AURA_MODE_SPLIT,
+	AURA_MODE_MAX,
+};
+
+struct asus_lamparray_lamp {
+	u16 id;
+	s32 x;
+	bool keyboard;
+};
+#endif
+
 struct asus_drvdata {
 	unsigned long quirks;
+	struct led_classdev slash_led;
+	bool has_slash_led;
+	u8 slash_mode;
+	u8 slash_brightness;
+	u8 slash_interval;
 	struct hid_device *hdev;
 	struct input_dev *input;
 	struct input_dev *tp_kbd_input;
@@ -170,6 +324,32 @@ struct asus_drvdata {
 	unsigned long battery_next_query;
 	struct asus_hid_listener listener;
 	bool fn_lock;
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	struct mutex aura_lock; /* Serializes Aura HID reports and buffers */
+	u8 *aura_buf;
+	struct led_classdev_dynamic dldev_global;
+	struct led_classdev_dynamic dldev_kbd;
+	struct led_classdev_dynamic dldev_lightbar;
+	const char *effects_global[ASUS_AURA_MAX_EFFECTS];
+	const char *effects_kbd[ASUS_AURA_MAX_EFFECTS];
+	const char *effects_lightbar[ASUS_AURA_MAX_EFFECTS];
+	bool has_dldev_global;
+	bool has_dldev_kbd;
+	bool has_dldev_lightbar;
+	bool is_strix_4zone;
+	bool has_lightbar;
+	enum asus_aura_mode aura_mode;
+	u8 kbd_direct_buf[ROG_STRIX_4ZONE_KBD_BUF_SIZE];
+	u8 lb_direct_buf[ROG_STRIX_LIGHTBAR_BUF_SIZE];
+	struct hid_device *lamparray_hdev;
+	u8 *lamparray_buf;
+	size_t lamparray_buf_len;
+	u8 lamparray_rid_base;
+	unsigned int lamparray_count;
+	bool lamparray_controlled;
+	bool lamparray_unavailable;
+	struct asus_lamparray_lamp *lamparray_lamps;
+#endif
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
@@ -577,15 +757,37 @@ static int asus_raw_event(struct hid_device *hdev,
 static int asus_kbd_set_report(struct hid_device *hdev, const u8 *buf, size_t buf_size)
 {
 	u8 *dmabuf __free(kfree) = kmemdup(buf, buf_size, GFP_KERNEL);
+	int ret;
+
 	if (!dmabuf)
 		return -ENOMEM;
+
+	/*
+	 * For Aura/Slash LED reports (0x5d/0x5e), match asus_aura_set_feature:
+	 * interrupt OUT, then raw OUTPUT, then raw FEATURE.
+	 */
+	if (buf[0] == FEATURE_KBD_LED_REPORT_ID1 ||
+	    buf[0] == FEATURE_KBD_LED_REPORT_ID2) {
+		ret = hid_hw_output_report(hdev, dmabuf, buf_size);
+		if (ret >= 0)
+			return 0;
+
+		ret = hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size,
+					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+		if (ret >= 0)
+			return 0;
+	}
 
 	/*
 	 * The report ID should be set from the incoming buffer due to LED and key
 	 * interfaces having different pages
 	 */
-	return hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size, HID_FEATURE_REPORT,
-				  HID_REQ_SET_REPORT);
+	ret = hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size, HID_FEATURE_REPORT,
+				 HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 static int asus_kbd_init(struct hid_device *hdev, u8 report_id)
@@ -868,7 +1070,7 @@ static int mcu_parse_version_string(const u8 *response, size_t response_size)
 
 static int mcu_request_version(struct hid_device *hdev)
 {
-	u8 *response __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
+	u8 *response __free(kfree) = kzalloc(FEATURE_KBD_REPORT_SIZE, GFP_KERNEL);
 	const u8 request[] = { 0x5a, 0x05, 0x03, 0x31, 0x00, 0x20 };
 	int ret;
 
@@ -880,39 +1082,53 @@ static int mcu_request_version(struct hid_device *hdev)
 		return ret;
 
 	ret = hid_hw_raw_request(hdev, FEATURE_REPORT_ID, response,
-				ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
+				FEATURE_KBD_REPORT_SIZE, HID_FEATURE_REPORT,
 				HID_REQ_GET_REPORT);
 	if (ret < 0)
 		return ret;
 
-	ret = mcu_parse_version_string(response, ROG_ALLY_REPORT_SIZE);
+	ret = mcu_parse_version_string(response, FEATURE_KBD_REPORT_SIZE);
 	if (ret < 0) {
 		pr_err("Failed to parse MCU version: %d\n", ret);
 		print_hex_dump(KERN_ERR, "MCU: ", DUMP_PREFIX_NONE,
-			      16, 1, response, ROG_ALLY_REPORT_SIZE, false);
+			      16, 1, response, FEATURE_KBD_REPORT_SIZE, false);
 	}
 
 	return ret;
 }
 
+/* Minimum MCU FW versions that no longer need the WMI suspend quirk. */
+static const struct {
+	u16 product;
+	int min_version;
+} asus_mcu_min_versions[] = {
+	{ USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY, 319 },
+	{ USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY_X, 313 },
+};
+
+static int asus_mcu_min_version(u16 id_product)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_mcu_min_versions); i++) {
+		if (asus_mcu_min_versions[i].product == id_product)
+			return asus_mcu_min_versions[i].min_version;
+	}
+
+	return 0;
+}
+
 static void validate_mcu_fw_version(struct hid_device *hdev, int idProduct)
 {
-	int min_version, version;
+	int min_version = asus_mcu_min_version(idProduct);
+	int version;
 
 	version = mcu_request_version(hdev);
 	if (version < 0)
 		return;
 
-	switch (idProduct) {
-	case USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY:
-		min_version = ROG_ALLY_MIN_MCU;
-		break;
-	case USB_DEVICE_ID_ASUSTEK_ROG_NKEY_ALLY_X:
-		min_version = ROG_ALLY_X_MIN_MCU;
-		break;
-	default:
-		min_version = 0;
-	}
+	if (!min_version)
+		return;
 
 	if (version < min_version) {
 		hid_warn(hdev,
@@ -937,6 +1153,48 @@ static bool asus_has_report_id(struct hid_device *hdev, u16 report_id)
 	}
 
 	return false;
+}
+
+/*
+ * Sibling USB interface with HID Lighting (LampArray) only — no Aura 0x5d.
+ * Bound by this driver without hidraw so lighting stays in-kernel DL.
+ */
+static int asus_lamparray_detect_base(struct hid_device *hdev)
+{
+	u8 base;
+
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
+	    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return -ENODEV;
+
+	for (base = 0; base <= 0x40; base += 0x40) {
+		if (asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_ATTR) &&
+		    asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_MULTI) &&
+		    asus_has_report_id(hdev, base + ASUS_LAMPARRAY_RID_CONTROL))
+			return base;
+	}
+
+	return -ENODEV;
+}
+
+static bool asus_is_lamparray_interface(struct hid_device *hdev)
+{
+	return asus_lamparray_detect_base(hdev) >= 0;
+}
+
+/*
+ * Slash is identified by HID feature reports, never DMI board lists:
+ * - report 0x5e is the dedicated Slash feature report on Aura keyboards
+ * - standalone Slash MCU reuses USB 0x193b (also AniMe) and talks over 0x5d
+ *   when 0x5e is absent; AniMe is rejected earlier because it has neither
+ */
+static bool asus_device_has_slash(struct hid_device *hdev)
+{
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return true;
+
+	return hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
+	       asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1);
 }
 
 static int asus_kbd_register_leds(struct hid_device *hdev)
@@ -978,6 +1236,1852 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
 
 	return ret;
 }
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+
+static const char * const asus_aura_mode_strings[] = {
+	[AURA_MODE_AUTO] = "auto",
+	[AURA_MODE_UNIFIED] = "unified",
+	[AURA_MODE_SPLIT] = "split",
+};
+
+static int asus_aura_set_feature_unlocked(struct asus_drvdata *drvdata,
+					  const u8 *buf, size_t buf_size)
+{
+	int ret;
+
+	if (buf_size > AURA_FEATURE_REPORT_SIZE)
+		return -EINVAL;
+
+	memcpy(drvdata->aura_buf, buf, buf_size);
+	if (buf_size < AURA_FEATURE_REPORT_SIZE)
+		memset(drvdata->aura_buf + buf_size, 0,
+		       AURA_FEATURE_REPORT_SIZE - buf_size);
+
+	/*
+	 * Try Output Report first matching Armoury Crate / asus_kbd_set_report.
+	 * If the device lacks an interrupt OUT endpoint, fall back to
+	 * hid_hw_raw_request() with HID_OUTPUT_REPORT, and finally to
+	 * HID_FEATURE_REPORT.
+	 */
+	ret = hid_hw_output_report(drvdata->hdev, drvdata->aura_buf,
+				   AURA_FEATURE_REPORT_SIZE);
+	if (ret >= 0)
+		return 0;
+
+	ret = hid_hw_raw_request(drvdata->hdev, drvdata->aura_buf[0],
+				 drvdata->aura_buf, AURA_FEATURE_REPORT_SIZE,
+				 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+	if (ret >= 0)
+		return 0;
+
+	ret = hid_hw_raw_request(drvdata->hdev, drvdata->aura_buf[0],
+				 drvdata->aura_buf, AURA_FEATURE_REPORT_SIZE,
+				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int asus_aura_set_feature(struct asus_drvdata *drvdata,
+				 const u8 *buf, size_t buf_size)
+{
+	guard(mutex)(&drvdata->aura_lock);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, buf_size);
+}
+
+static int asus_aura_get_feature(struct asus_drvdata *drvdata,
+				 u8 *buf, size_t buf_size)
+{
+	int ret;
+
+	if (buf_size > AURA_FEATURE_REPORT_SIZE)
+		return -EINVAL;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	memset(drvdata->aura_buf, 0, AURA_FEATURE_REPORT_SIZE);
+	drvdata->aura_buf[0] = buf[0];
+
+	ret = hid_hw_raw_request(drvdata->hdev, buf[0], drvdata->aura_buf,
+				 AURA_FEATURE_REPORT_SIZE,
+				 HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	memcpy(buf, drvdata->aura_buf, min_t(size_t, buf_size, ret));
+	return ret;
+}
+
+static int asus_aura_commit(struct asus_drvdata *drvdata)
+{
+	u8 buf_set[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_SET,
+	};
+	u8 buf_apply[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_COMMIT,
+	};
+	int ret;
+
+	/*
+	 * Apply staged 0xb3 effect programming:
+	 * First send 0xb5 (AURA_CMD_SET) to latch parameters,
+	 * then send 0xb4 (AURA_CMD_COMMIT) to apply them to hardware,
+	 * then send 0xb5 (AURA_CMD_SET) to settle as captured in firmware traces.
+	 */
+	ret = asus_aura_set_feature(drvdata, buf_set, sizeof(buf_set));
+	if (ret < 0)
+		return ret;
+
+	ret = asus_aura_set_feature(drvdata, buf_apply, sizeof(buf_apply));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature(drvdata, buf_set, sizeof(buf_set));
+}
+
+static int asus_aura_query_run_mode(struct asus_drvdata *drvdata, u8 selector,
+				    u8 *buf, size_t buf_size)
+{
+	u8 req[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_RUN_MODE,
+		0x01,
+		selector,
+	};
+	int ret;
+
+	ret = asus_aura_set_feature(drvdata, req, sizeof(req));
+	if (ret < 0)
+		return ret;
+
+	memset(buf, 0, buf_size);
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+
+	ret = asus_aura_get_feature(drvdata, buf, buf_size);
+	if (ret < 0)
+		return ret;
+
+	if (ret < 5 || buf[1] != AURA_CMD_RUN_MODE || buf[2] != 0x01 ||
+	    buf[3] != selector || buf[4] != 0x01)
+		return -ENODATA;
+
+	return ret;
+}
+
+static int asus_aura_get_effect_mask(struct asus_drvdata *drvdata, u8 effect_mask[2])
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	int ret;
+
+	ret = asus_aura_query_run_mode(drvdata, 0x20, buf, sizeof(buf));
+	if (ret >= 22)
+		goto found;
+
+	ret = asus_aura_query_run_mode(drvdata, 0x15, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+	if (ret < 22)
+		return -ENODATA;
+
+found:
+	effect_mask[0] = buf[20];
+	effect_mask[1] = buf[21];
+
+	return 0;
+}
+
+static const struct {
+	const char *name;
+	u8 hw_mode;
+} asus_aura_effect_map[] = {
+	{ "static",		AURA_EFFECT_STATIC },
+	{ "breathe",		AURA_EFFECT_BREATHING },
+	{ "rainbow_cycle",	AURA_EFFECT_SPECTRUM_CYCLE },
+	{ "rainbow_wave",	AURA_EFFECT_RAINBOW },
+	{ "star",		AURA_EFFECT_STARS },
+	{ "rain",		AURA_EFFECT_RAIN },
+	{ "highlight",		AURA_EFFECT_REACTIVE },
+	{ "laser",		AURA_EFFECT_LASER },
+	{ "ripple",		AURA_EFFECT_RIPPLE },
+	{ "pulse",		AURA_EFFECT_PULSE },
+	{ "comet",		AURA_EFFECT_COMET },
+	{ "flash",		AURA_EFFECT_FLASH },
+};
+
+static unsigned int asus_aura_fill_effects(const char **dst,
+					   const u8 *effect_mask,
+					   bool direct_capable)
+{
+	unsigned int i, n = 0;
+	u16 mask = effect_mask ? (effect_mask[0] | ((u16)effect_mask[1] << 8))
+			       : (u16)~0;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
+		if (mask & BIT(asus_aura_effect_map[i].hw_mode))
+			dst[n++] = asus_aura_effect_map[i].name;
+	}
+	if (direct_capable)
+		dst[n++] = "direct";
+
+	return n;
+}
+
+static int asus_aura_hw_mode_from_name(const char *name, u8 *aura_mode)
+{
+	unsigned int i;
+
+	if (!name)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
+		if (!strcmp(name, asus_aura_effect_map[i].name)) {
+			*aura_mode = asus_aura_effect_map[i].hw_mode;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int asus_aura_activate_zone_unlocked(struct asus_drvdata *drvdata, u8 zone)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = { 0 };
+
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_ZONE_ENABLE;
+	buf[2] = zone;
+	buf[3] = 0x01;
+	buf[4] = 0x01;
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_activate_zone(struct asus_drvdata *drvdata, u8 zone)
+{
+	guard(mutex)(&drvdata->aura_lock);
+
+	return asus_aura_activate_zone_unlocked(drvdata, zone);
+}
+
+static int asus_aura_activate_zones(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_KEYBOARD);
+	if (ret < 0)
+		return ret;
+	if (drvdata->has_lightbar)
+		return asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+	return 0;
+}
+
+static int asus_aura_wake_all_zones(struct asus_drvdata *drvdata)
+{
+	u8 buf_pwr[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_POWER,
+		AURA_POWER_CMD_ENABLE,
+		AURA_POWER_MASK_KBD_LOGO_ALL,
+		AURA_POWER_MASK_LIGHTBAR_ALL,
+		AURA_POWER_MASK_LID_ALL,
+		AURA_POWER_MASK_REAR_ALL,
+		0x00,
+	};
+	int ret;
+
+	/* Unmute power gating across keyboard, lightbar, logo, lid, and rear-glow */
+	ret = asus_aura_set_feature(drvdata, buf_pwr, sizeof(buf_pwr));
+	if (ret < 0)
+		return ret;
+
+	/* Activate keyboard zone */
+	ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_KEYBOARD);
+	if (ret < 0)
+		return ret;
+
+	/* Activate lightbar zone */
+	return asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+}
+
+static enum asus_aura_mode asus_aura_effective_mode(struct asus_drvdata *drvdata);
+static int asus_aura_apply_effect(struct led_classdev_dynamic *ldev,
+				  enum led_brightness brightness);
+
+static void asus_aura_restore(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	if (!drvdata->has_dldev_kbd && !drvdata->has_dldev_global)
+		return;
+
+	ret = asus_aura_activate_zones(drvdata);
+	if (ret < 0)
+		hid_warn(drvdata->hdev, "Failed to activate Aura zones: %d\n", ret);
+
+	if (asus_aura_effective_mode(drvdata) == AURA_MODE_UNIFIED) {
+		if (drvdata->has_dldev_global)
+			asus_aura_apply_effect(&drvdata->dldev_global,
+					       drvdata->dldev_global.cdev.brightness);
+		return;
+	}
+
+	if (drvdata->has_dldev_kbd)
+		asus_aura_apply_effect(&drvdata->dldev_kbd,
+				       drvdata->dldev_kbd.cdev.brightness);
+	if (drvdata->has_dldev_lightbar)
+		asus_aura_apply_effect(&drvdata->dldev_lightbar,
+				       drvdata->dldev_lightbar.cdev.brightness);
+}
+
+static int asus_aura_write_zone_effect(struct asus_drvdata *drvdata, u8 zone,
+				       u8 aura_mode, u8 r, u8 g, u8 b,
+				       u8 speed, u8 direction,
+				       u8 r2, u8 g2, u8 b2,
+				       bool commit)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = { 0 };
+	int ret;
+
+	if (zone == AURA_ZONE_BAR_LEFT || zone == AURA_ZONE_BAR_RIGHT) {
+		ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+		if (ret < 0)
+			return ret;
+	}
+
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_SET_EFFECT;
+	buf[2] = zone;
+	buf[3] = aura_mode;
+	buf[4] = r;
+	buf[5] = g;
+	buf[6] = b;
+	buf[7] = speed;
+	buf[8] = direction;
+	buf[9] = 0x00;
+	buf[10] = r2;
+	buf[11] = g2;
+	buf[12] = b2;
+
+	ret = asus_aura_set_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	if (commit)
+		return asus_aura_commit(drvdata);
+
+	return 0;
+}
+
+static size_t asus_lamparray_report_len(struct hid_device *hdev, u8 id)
+{
+	struct hid_report *report;
+
+	report = hdev->report_enum[HID_FEATURE_REPORT].report_id_hash[id];
+	if (!report)
+		return 0;
+	return hid_report_len(report);
+}
+
+static u8 asus_lamparray_rid(struct asus_drvdata *drvdata, u8 offset)
+{
+	return drvdata->lamparray_rid_base + offset;
+}
+
+static int asus_lamparray_raw(struct asus_drvdata *drvdata, u8 *buf, size_t len,
+			      bool get)
+{
+	int ret;
+
+	if (!drvdata->lamparray_hdev || !len)
+		return -ENODEV;
+
+	ret = hid_hw_raw_request(drvdata->lamparray_hdev, buf[0], buf, len,
+				 HID_FEATURE_REPORT,
+				 get ? HID_REQ_GET_REPORT : HID_REQ_SET_REPORT);
+	return ret < 0 ? ret : 0;
+}
+
+static void asus_lamparray_prepare(struct asus_drvdata *drvdata, u8 rid)
+{
+	memset(drvdata->lamparray_buf, 0, drvdata->lamparray_buf_len);
+	drvdata->lamparray_buf[0] = rid;
+}
+
+static struct hid_device *asus_find_lamparray_sibling(struct hid_device *hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	struct usb_host_config *config;
+	unsigned int i;
+
+	if (!hid_is_usb(hdev))
+		return NULL;
+
+	intf = to_usb_interface(hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+	if (!udev->actconfig)
+		return NULL;
+
+	config = udev->actconfig;
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *other = config->interface[i];
+		struct hid_device *other_hdev;
+
+		if (!other || other == intf)
+			continue;
+		if (!other->dev.driver || other->dev.driver != intf->dev.driver)
+			continue;
+
+		other_hdev = usb_get_intfdata(other);
+		if (!other_hdev)
+			continue;
+		if (other_hdev->vendor != hdev->vendor ||
+		    other_hdev->product != hdev->product)
+			continue;
+		if (asus_is_lamparray_interface(other_hdev))
+			return other_hdev;
+	}
+
+	return NULL;
+}
+
+static void asus_lamparray_unbind_from_owners(struct hid_device *la_hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	struct usb_host_config *config;
+	unsigned int i;
+
+	if (!hid_is_usb(la_hdev))
+		return;
+
+	intf = to_usb_interface(la_hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+	if (!udev->actconfig)
+		return;
+
+	config = udev->actconfig;
+	for (i = 0; i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *other = config->interface[i];
+		struct hid_device *other_hdev;
+		struct asus_drvdata *owner;
+
+		if (!other || other == intf)
+			continue;
+		if (!other->dev.driver || other->dev.driver != intf->dev.driver)
+			continue;
+
+		other_hdev = usb_get_intfdata(other);
+		if (!other_hdev || other_hdev->driver != la_hdev->driver)
+			continue;
+
+		owner = hid_get_drvdata(other_hdev);
+		if (!owner)
+			continue;
+
+		mutex_lock(&owner->aura_lock);
+		if (owner->lamparray_hdev == la_hdev) {
+			owner->lamparray_controlled = false;
+			owner->lamparray_count = 0;
+			owner->lamparray_lamps = NULL;
+			owner->lamparray_hdev = NULL;
+			owner->lamparray_unavailable = true;
+			mutex_unlock(&owner->aura_lock);
+			put_device(&la_hdev->dev);
+			return;
+		}
+		mutex_unlock(&owner->aura_lock);
+	}
+}
+
+static int asus_lamparray_cmp_x(const void *a, const void *b)
+{
+	const struct asus_lamparray_lamp *la = a;
+	const struct asus_lamparray_lamp *lb = b;
+
+	return cmp_int(la->x, lb->x);
+}
+
+static int asus_lamparray_init_from_hdev(struct asus_drvdata *drvdata,
+					 struct hid_device *la_hdev)
+{
+	u8 *buf;
+	size_t attr_len, req_len, resp_len, multi_len, ctrl_len, max_len;
+	unsigned int count, i;
+	int base, ret;
+
+	base = asus_lamparray_detect_base(la_hdev);
+	if (base < 0)
+		return base;
+
+	attr_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_ATTR);
+	req_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_REQUEST);
+	resp_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_RESPONSE);
+	multi_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_MULTI);
+	ctrl_len = asus_lamparray_report_len(la_hdev, base + ASUS_LAMPARRAY_RID_CONTROL);
+	max_len = max3(max(attr_len, req_len), max(resp_len, multi_len), ctrl_len);
+	if (attr_len < 3 || req_len < 3 || resp_len < 23 || multi_len < 51 ||
+	    ctrl_len < 2 || !max_len)
+		return -EPROTO;
+
+	buf = devm_kzalloc(&drvdata->hdev->dev, max_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	drvdata->lamparray_hdev = la_hdev;
+	drvdata->lamparray_buf = buf;
+	drvdata->lamparray_buf_len = max_len;
+	drvdata->lamparray_rid_base = base;
+
+	asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_ATTR);
+	ret = asus_lamparray_raw(drvdata, buf, attr_len, true);
+	if (ret < 0)
+		return ret;
+
+	count = get_unaligned_le16(buf + 1);
+	if (!count || count > ASUS_LAMPARRAY_MAX_LAMPS)
+		return -EPROTO;
+
+	drvdata->lamparray_lamps = devm_kcalloc(&drvdata->hdev->dev, count,
+						sizeof(*drvdata->lamparray_lamps),
+						GFP_KERNEL);
+	if (!drvdata->lamparray_lamps)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		u32 purposes;
+
+		asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_REQUEST);
+		put_unaligned_le16(i, buf + 1);
+		ret = asus_lamparray_raw(drvdata, buf, req_len, false);
+		if (ret < 0)
+			return ret;
+
+		asus_lamparray_prepare(drvdata, base + ASUS_LAMPARRAY_RID_RESPONSE);
+		ret = asus_lamparray_raw(drvdata, buf, resp_len, true);
+		if (ret < 0)
+			return ret;
+
+		/* LampId@1, PositionX@3, LampPurposes@19 (HID Lighting) */
+		drvdata->lamparray_lamps[i].id = get_unaligned_le16(buf + 1);
+		drvdata->lamparray_lamps[i].x = (s32)get_unaligned_le32(buf + 3);
+		purposes = get_unaligned_le32(buf + 19);
+		drvdata->lamparray_lamps[i].keyboard =
+			!!(purposes & ASUS_LAMPARRAY_PURPOSE_CONTROL);
+	}
+
+	drvdata->lamparray_count = count;
+	sort(drvdata->lamparray_lamps, count, sizeof(*drvdata->lamparray_lamps),
+	     asus_lamparray_cmp_x, NULL);
+	get_device(&la_hdev->dev);
+	hid_info(drvdata->hdev,
+		 "LampArray direct RGB backend (%u lamps, rid_base=0x%02x)\n",
+		 count, base);
+	return 0;
+}
+
+static void asus_lamparray_try_init_unlocked(struct asus_drvdata *drvdata)
+{
+	struct hid_device *sibling;
+	int ret;
+
+	if (drvdata->lamparray_count || drvdata->lamparray_unavailable)
+		return;
+
+	sibling = asus_find_lamparray_sibling(drvdata->hdev);
+	if (!sibling)
+		return;
+
+	ret = asus_lamparray_init_from_hdev(drvdata, sibling);
+	if (ret < 0) {
+		hid_warn(drvdata->hdev, "LampArray init failed: %d\n", ret);
+		drvdata->lamparray_hdev = NULL;
+		drvdata->lamparray_lamps = NULL;
+		drvdata->lamparray_count = 0;
+		drvdata->lamparray_unavailable = true;
+	}
+}
+
+static int asus_lamparray_set_control_unlocked(struct asus_drvdata *drvdata,
+					       bool autonomous)
+{
+	u8 rid = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_CONTROL);
+	size_t len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid);
+
+	if (len < 2)
+		return -EPROTO;
+
+	asus_lamparray_prepare(drvdata, rid);
+	drvdata->lamparray_buf[1] = autonomous ? 0x01 : 0x00;
+	return asus_lamparray_raw(drvdata, drvdata->lamparray_buf, len, false);
+}
+
+static int asus_lamparray_aura_handoff_unlocked(struct asus_drvdata *drvdata,
+						u8 zone, bool release)
+{
+	u8 aura[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_ZONE_ENABLE,
+		zone,
+		0x01,
+	};
+
+	if (release)
+		aura[4] = 0x01;
+
+	return asus_aura_set_feature_unlocked(drvdata, aura, sizeof(aura));
+}
+
+static int asus_lamparray_take_control_unlocked(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	if (drvdata->lamparray_controlled)
+		return 0;
+
+	ret = asus_lamparray_aura_handoff_unlocked(drvdata,
+						   AURA_ZONE_ACTIVATE_LAMPARRAY,
+						   false);
+	if (ret < 0)
+		return ret;
+
+	/* Match G-Helper: pulse then clear AutonomousMode for host control */
+	ret = asus_lamparray_set_control_unlocked(drvdata, true);
+	if (ret < 0)
+		return ret;
+	ret = asus_lamparray_set_control_unlocked(drvdata, false);
+	if (ret < 0)
+		return ret;
+
+	drvdata->lamparray_controlled = true;
+	return 0;
+}
+
+static void asus_lamparray_release_unlocked(struct asus_drvdata *drvdata)
+{
+	if (!drvdata->lamparray_count || !drvdata->lamparray_controlled)
+		return;
+
+	asus_lamparray_set_control_unlocked(drvdata, true);
+	asus_lamparray_aura_handoff_unlocked(drvdata,
+					     AURA_ZONE_RELEASE_LAMPARRAY,
+					     true);
+	drvdata->lamparray_controlled = false;
+}
+
+static void asus_lamparray_sample_rgb(const u8 *buf, unsigned int nleds,
+				      unsigned int idx, unsigned int n,
+				      u8 *r, u8 *g, u8 *b)
+{
+	unsigned int zi;
+
+	if (!buf || !nleds || !n) {
+		*r = *g = *b = 0;
+		return;
+	}
+
+	zi = (idx * nleds) / n;
+	if (zi >= nleds)
+		zi = nleds - 1;
+	*r = buf[zi * 3];
+	*g = buf[zi * 3 + 1];
+	*b = buf[zi * 3 + 2];
+}
+
+static void asus_lamparray_fill_solid(u8 *buf, unsigned int nleds,
+				      u8 r, u8 g, u8 b)
+{
+	unsigned int i;
+
+	for (i = 0; i < nleds; i++) {
+		buf[i * 3 + 0] = r;
+		buf[i * 3 + 1] = g;
+		buf[i * 3 + 2] = b;
+	}
+}
+
+static unsigned int asus_aura_lb_led_count(struct asus_drvdata *drvdata)
+{
+	return drvdata->is_strix_4zone ? ROG_STRIX_4ZONE_LIGHTBAR_LEDS :
+					 ROG_STRIX_LIGHTBAR_LEDS;
+}
+
+static void asus_aura_init_direct_bufs(struct asus_drvdata *drvdata)
+{
+	asus_lamparray_fill_solid(drvdata->kbd_direct_buf, ROG_STRIX_4ZONE_KBD_LEDS,
+				  255, 0, 0);
+	asus_lamparray_fill_solid(drvdata->lb_direct_buf,
+				  asus_aura_lb_led_count(drvdata), 255, 0, 0);
+}
+
+static int asus_lamparray_apply_unlocked(struct asus_drvdata *drvdata)
+{
+	unsigned int kbd_n = 0, lb_n = 0, kbd_i = 0, lb_i = 0, i;
+	unsigned int kbd_leds = ROG_STRIX_4ZONE_KBD_LEDS;
+	unsigned int lb_leds = asus_aura_lb_led_count(drvdata);
+	u8 *buf = drvdata->lamparray_buf;
+	u8 rid_multi = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_MULTI);
+	size_t multi_len;
+	int ret;
+
+	ret = asus_lamparray_take_control_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < drvdata->lamparray_count; i++) {
+		if (drvdata->lamparray_lamps[i].keyboard)
+			kbd_n++;
+		else
+			lb_n++;
+	}
+
+	multi_len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid_multi);
+	if (multi_len < 51)
+		return -EPROTO;
+
+	for (i = 0; i < drvdata->lamparray_count; i += ASUS_LAMPARRAY_MULTI_MAX) {
+		unsigned int n = min_t(unsigned int, ASUS_LAMPARRAY_MULTI_MAX,
+				       drvdata->lamparray_count - i);
+		unsigned int j;
+		unsigned int id_off = 3;
+		unsigned int col_off = 3 + ASUS_LAMPARRAY_MULTI_MAX * 2;
+
+		asus_lamparray_prepare(drvdata, rid_multi);
+		buf[1] = n;
+		buf[2] = (i + n >= drvdata->lamparray_count) ?
+			 ASUS_LAMPARRAY_FLAG_COMPLETE : 0;
+
+		for (j = 0; j < n; j++) {
+			unsigned int lamp = i + j;
+			u8 r, g, b;
+			u16 id = drvdata->lamparray_lamps[lamp].id;
+
+			if (drvdata->lamparray_lamps[lamp].keyboard) {
+				asus_lamparray_sample_rgb(drvdata->kbd_direct_buf,
+							  kbd_leds, kbd_i++, kbd_n,
+							  &r, &g, &b);
+			} else {
+				asus_lamparray_sample_rgb(drvdata->lb_direct_buf,
+							  lb_leds, lb_i++, lb_n,
+							  &r, &g, &b);
+			}
+
+			put_unaligned_le16(id, buf + id_off + j * 2);
+			buf[col_off + j * 4 + 0] = r;
+			buf[col_off + j * 4 + 1] = g;
+			buf[col_off + j * 4 + 2] = b;
+			buf[col_off + j * 4 + 3] = 0xff;
+		}
+
+		ret = asus_lamparray_raw(drvdata, buf, multi_len, false);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* Prefer LampArray; callers keep Aura 0xBC as fallback on -ENODEV. */
+static int asus_lamparray_try_apply_unlocked(struct asus_drvdata *drvdata)
+{
+	asus_lamparray_try_init_unlocked(drvdata);
+	if (!drvdata->lamparray_count)
+		return -ENODEV;
+	return asus_lamparray_apply_unlocked(drvdata);
+}
+
+static int asus_aura_write_4zone_direct_bc_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_DIRECT;
+	buf[2] = AURA_DIRECT_FRAME_ZONED;
+	buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+	buf[4] = AURA_ZONE_LIGHTBAR_CHANNEL;
+	memcpy(&buf[ROG_STRIX_4ZONE_DIRECT_KBD_OFFSET],
+	       drvdata->kbd_direct_buf,
+	       sizeof(drvdata->kbd_direct_buf));
+	memcpy(&buf[ROG_STRIX_4ZONE_DIRECT_LB_OFFSET],
+	       drvdata->lb_direct_buf,
+	       ROG_STRIX_4ZONE_LIGHTBAR_BUF_SIZE);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_strix_write_direct(struct asus_drvdata *drvdata,
+					const u8 *buffer, size_t size)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	unsigned int i;
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	if (drvdata->is_strix_4zone) {
+		unsigned int leds = min_t(size_t, size / 3,
+					  ROG_STRIX_4ZONE_KBD_LEDS);
+
+		if (buffer != drvdata->kbd_direct_buf)
+			memcpy(drvdata->kbd_direct_buf, buffer, leds * 3);
+
+		ret = asus_lamparray_try_apply_unlocked(drvdata);
+		if (ret != -ENODEV)
+			return ret;
+
+		return asus_aura_write_4zone_direct_bc_unlocked(drvdata);
+	}
+
+	/*
+	 * Stream ROG Strix per-key matrix in 16-LED chunks using
+	 * Aura HID Feature Reports with opcode 0xbc:
+	 * [0]    = Report ID (0x5d)
+	 * [1]    = Direct frame command (0xbc)
+	 * [2..5] = Routing header (0x00, 0x01, 0x01, 0x01)
+	 * [6]    = Start LED index (0, 16, 32, ..., 160)
+	 * [7]    = Number of LEDs in chunk (16 for chunks 0..9, 8 for chunk 10)
+	 * [8]    = Reserved / 0x00
+	 * [9..]  = RGB payload (3 bytes per LED)
+	 *
+	 * Total LEDs: 168 (11 packets). Strictly terminate at packet 10;
+	 * sending a 12th packet triggers a firmware defect that shuts off the
+	 * rear and front lightbars. No 0xb4 commit command is issued for raw
+	 * direct frames to avoid stepping hardware animation registers.
+	 */
+	for (i = 0; i < ROG_STRIX_DIRECT_LEDS; i += ROG_STRIX_LEDS_PER_PKT) {
+		unsigned int leds = min_t(unsigned int, ROG_STRIX_DIRECT_LEDS - i,
+					  ROG_STRIX_LEDS_PER_PKT);
+		size_t payload_len = leds * 3;
+
+		memset(buf, 0, sizeof(buf));
+		buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+		buf[1] = AURA_CMD_DIRECT;
+		buf[2] = AURA_DIRECT_FRAME_PERKEY;
+		buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+		buf[4] = AURA_ZONE_KEYBOARD_CHANNEL;
+		buf[5] = AURA_DIRECT_CHUNK_FLAG;
+		buf[6] = (u8)i;
+		buf[7] = (u8)leds;
+		buf[8] = 0x00;
+		memcpy(&buf[ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET],
+		       buffer + (i * 3), payload_len);
+
+		ret = asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static bool asus_aura_is_global(struct asus_drvdata *drvdata,
+				struct led_classdev_dynamic *ldev)
+{
+	return ldev == &drvdata->dldev_global;
+}
+
+static bool asus_aura_is_lightbar(struct asus_drvdata *drvdata,
+				  struct led_classdev_dynamic *ldev)
+{
+	return ldev == &drvdata->dldev_lightbar;
+}
+
+static int asus_lamparray_apply_solid_unlocked(struct asus_drvdata *drvdata,
+					       struct led_classdev_dynamic *ldev,
+					       u8 r, u8 g, u8 b)
+{
+	unsigned int lb_leds = asus_aura_lb_led_count(drvdata);
+
+	asus_lamparray_try_init_unlocked(drvdata);
+	if (!drvdata->lamparray_count)
+		return -ENODEV;
+
+	if (asus_aura_is_global(drvdata, ldev)) {
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf,
+					  ROG_STRIX_4ZONE_KBD_LEDS, r, g, b);
+		asus_lamparray_fill_solid(drvdata->lb_direct_buf, lb_leds, r, g, b);
+	} else if (asus_aura_is_lightbar(drvdata, ldev)) {
+		asus_lamparray_fill_solid(drvdata->lb_direct_buf, lb_leds, r, g, b);
+	} else {
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf,
+					  ROG_STRIX_4ZONE_KBD_LEDS, r, g, b);
+	}
+
+	return asus_lamparray_apply_unlocked(drvdata);
+}
+
+static int asus_aura_write_zone_range(struct asus_drvdata *drvdata,
+				      u8 zone_first, u8 zone_last,
+				      u8 aura_effect, u8 r, u8 g, u8 b,
+				      u8 speed, u8 direction,
+				      u8 r2, u8 g2, u8 b2)
+{
+	u8 z;
+	int ret;
+
+	for (z = zone_first; z <= zone_last; z++) {
+		ret = asus_aura_write_zone_effect(drvdata, z, aura_effect,
+						  r, g, b, speed, direction,
+						  r2, g2, b2, false);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_aura_commit(drvdata);
+}
+
+static enum asus_aura_mode asus_aura_effective_mode(struct asus_drvdata *drvdata)
+{
+	enum asus_aura_mode mode = READ_ONCE(drvdata->aura_mode);
+
+	/*
+	 * auto resolves to split: keyboard and lightbar (when present) stay
+	 * independently writable. Userspace can select unified for a single
+	 * global effect across zones.
+	 */
+	if (mode == AURA_MODE_AUTO)
+		return AURA_MODE_SPLIT;
+	return mode;
+}
+
+static int asus_aura_check_node_active(struct asus_drvdata *drvdata,
+				       struct led_classdev_dynamic *ldev)
+{
+	enum asus_aura_mode mode = asus_aura_effective_mode(drvdata);
+
+	if (mode == AURA_MODE_UNIFIED) {
+		if (!asus_aura_is_global(drvdata, ldev))
+			return -EBUSY;
+	} else if (mode == AURA_MODE_SPLIT) {
+		if (asus_aura_is_global(drvdata, ldev))
+			return -EBUSY;
+	}
+
+	return 0;
+}
+
+static ssize_t aura_mode_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct led_classdev_dynamic *dldev = lcdev_to_dldev(led);
+	struct asus_drvdata *drvdata = dldev->driver_data;
+	int len = 0;
+	int i;
+
+	for (i = 0; i < AURA_MODE_MAX; i++) {
+		if (drvdata->aura_mode == i)
+			len += sysfs_emit_at(buf, len, "[%s] ", asus_aura_mode_strings[i]);
+		else
+			len += sysfs_emit_at(buf, len, "%s ", asus_aura_mode_strings[i]);
+	}
+	if (len > 0)
+		buf[len - 1] = '\n';
+
+	return len;
+}
+
+static ssize_t aura_mode_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct led_classdev_dynamic *dldev = lcdev_to_dldev(led);
+	struct asus_drvdata *drvdata = dldev->driver_data;
+	int val;
+
+	val = sysfs_match_string(asus_aura_mode_strings, buf);
+	if (val < 0) {
+		u8 num;
+
+		if (kstrtou8(buf, 0, &num) < 0 || num >= AURA_MODE_MAX)
+			return -EINVAL;
+		val = num;
+	}
+
+	guard(mutex)(&drvdata->aura_lock);
+	WRITE_ONCE(drvdata->aura_mode, val);
+
+	return count;
+}
+static DEVICE_ATTR_RW(aura_mode);
+
+static struct attribute *asus_aura_attrs[] = {
+	&dev_attr_aura_mode.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_aura_group = {
+	.attrs = asus_aura_attrs,
+};
+
+static const struct attribute_group *asus_aura_groups[] = {
+	&asus_aura_group,
+	NULL,
+};
+
+static int asus_aura_strix_set_direct(struct led_classdev_dynamic *ldev,
+				      const u8 *buffer, size_t size)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	ret = asus_aura_check_node_active(drvdata, ldev);
+	if (ret < 0)
+		return ret;
+
+	if (size != ldev->led_count * 3)
+		return -EINVAL;
+
+	if (!led_dynamic_effect_is(ldev, "direct")) {
+		ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_KEYBOARD);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_aura_strix_write_direct(drvdata, buffer, size);
+}
+
+static int asus_aura_lightbar_write_packet(struct asus_drvdata *drvdata,
+					   const u8 *buffer, size_t size)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE];
+	size_t payload_len;
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	if (drvdata->is_strix_4zone) {
+		unsigned int leds = min_t(size_t, size / 3,
+					  ROG_STRIX_4ZONE_LIGHTBAR_LEDS);
+
+		if (buffer != drvdata->lb_direct_buf)
+			memcpy(drvdata->lb_direct_buf, buffer, leds * 3);
+
+		ret = asus_lamparray_try_apply_unlocked(drvdata);
+		if (ret != -ENODEV)
+			return ret;
+
+		return asus_aura_write_4zone_direct_bc_unlocked(drvdata);
+	}
+
+	payload_len = min_t(size_t, size, ROG_STRIX_LIGHTBAR_BUF_SIZE);
+
+	/*
+	 * Per-Key models use buf[2] = 0x00 (chunked packet), so the MCU
+	 * expects valid chunk headers in bytes 5-7. Without them it reads
+	 * "0 LEDs to update" and silently drops the packet.
+	 */
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	buf[1] = AURA_CMD_DIRECT;
+	buf[2] = AURA_DIRECT_FRAME_PERKEY;
+	buf[3] = AURA_DIRECT_ROUTING_DEFAULT;
+	buf[4] = AURA_ZONE_LIGHTBAR_CHANNEL;
+	buf[5] = AURA_DIRECT_CHUNK_FLAG;
+	buf[6] = 0x00;             /* start LED index */
+	buf[7] = (u8)(payload_len / 3); /* number of LEDs in this packet */
+
+	if (buffer != drvdata->lb_direct_buf)
+		memcpy(drvdata->lb_direct_buf, buffer, payload_len);
+	memcpy(&buf[ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET],
+	       drvdata->lb_direct_buf, payload_len);
+
+	return asus_aura_set_feature_unlocked(drvdata, buf, sizeof(buf));
+}
+
+static int asus_aura_lightbar_set_direct(struct led_classdev_dynamic *ldev,
+					 const u8 *buffer, size_t size)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	ret = asus_aura_check_node_active(drvdata, ldev);
+	if (ret < 0)
+		return ret;
+
+	if (size != ldev->led_count * 3)
+		return -EINVAL;
+
+	if (!led_dynamic_effect_is(ldev, "direct")) {
+		ret = asus_aura_activate_zone(drvdata, AURA_ZONE_ACTIVATE_LIGHTBAR);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_aura_lightbar_write_packet(drvdata, buffer, size);
+}
+
+static int asus_aura_apply_effect(struct led_classdev_dynamic *ldev,
+				  enum led_brightness brightness)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	const char *name = led_dynamic_effect_name(ldev);
+	bool lights_on = brightness > LED_OFF;
+	u8 aura_mode;
+	u8 speed;
+	u8 direction = 0;
+	u8 r = 0, g = 0, b = 0;
+	u8 r2 = 0, g2 = 0, b2 = 0;
+	int ret;
+
+	ret = asus_aura_check_node_active(drvdata, ldev);
+	if (ret < 0)
+		return ret;
+
+	if (lights_on && ldev->num_palette_entries > 0) {
+		r = (u8)(((unsigned int)ldev->palette[0].r * brightness) / 255);
+		g = (u8)(((unsigned int)ldev->palette[0].g * brightness) / 255);
+		b = (u8)(((unsigned int)ldev->palette[0].b * brightness) / 255);
+		if (ldev->num_palette_entries > 1) {
+			r2 = (u8)(((unsigned int)ldev->palette[1].r * brightness) / 255);
+			g2 = (u8)(((unsigned int)ldev->palette[1].g * brightness) / 255);
+			b2 = (u8)(((unsigned int)ldev->palette[1].b * brightness) / 255);
+		}
+	}
+
+	if (led_dynamic_effect_is(ldev, "direct"))
+		return 0;
+
+	switch (ldev->speed) {
+	case 0:
+		speed = AURA_SPEED_SLOW;
+		break;
+	case 2:
+		speed = AURA_SPEED_FAST;
+		break;
+	case 1:
+	default:
+		speed = AURA_SPEED_MED;
+		break;
+	}
+
+	if (!lights_on) {
+		aura_mode = AURA_EFFECT_STATIC;
+		r = 0;
+		g = 0;
+		b = 0;
+		r2 = 0;
+		g2 = 0;
+		b2 = 0;
+	} else if (asus_aura_hw_mode_from_name(name, &aura_mode)) {
+		return -EINVAL;
+	}
+
+	if (ldev->direction == DL_DIRECTION_LEFT)
+		direction = 1;
+	else if (ldev->direction == DL_DIRECTION_RIGHT)
+		direction = 0;
+	else if (ldev->direction == DL_DIRECTION_UP)
+		direction = 2;
+	else if (ldev->direction == DL_DIRECTION_DOWN)
+		direction = 3;
+
+	/*
+	 * Solid colours via LampArray (independent keyboard/lightbar).
+	 * Firmware animations release LampArray and use Aura 0xb3.
+	 */
+	{
+		guard(mutex)(&drvdata->aura_lock);
+
+		if (aura_mode == AURA_EFFECT_STATIC) {
+			ret = asus_lamparray_apply_solid_unlocked(drvdata, ldev, r, g, b);
+			if (ret != -ENODEV)
+				return ret;
+		} else {
+			asus_lamparray_try_init_unlocked(drvdata);
+			if (drvdata->lamparray_count)
+				asus_lamparray_release_unlocked(drvdata);
+		}
+	}
+
+	if (asus_aura_is_global(drvdata, ldev))
+		return asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL, aura_mode,
+						   r, g, b, speed, direction,
+						   r2, g2, b2, true);
+
+	if (asus_aura_is_lightbar(drvdata, ldev))
+		return asus_aura_write_zone_range(drvdata, AURA_ZONE_BAR_LEFT,
+						  AURA_ZONE_BAR_RIGHT, aura_mode,
+						  r, g, b, speed, direction,
+						  r2, g2, b2);
+
+	if (drvdata->is_strix_4zone)
+		return asus_aura_write_zone_range(drvdata, AURA_ZONE_KEY1,
+						  AURA_ZONE_KEY4, aura_mode,
+						  r, g, b, speed, direction,
+						  r2, g2, b2);
+
+	return asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL, aura_mode, r, g, b,
+					   speed, direction, r2, g2, b2, true);
+}
+
+static int asus_aura_set_effect(struct led_classdev_dynamic *ldev,
+				unsigned int index)
+{
+	struct led_classdev *cdev = led_dynamic_cdev(ldev);
+	unsigned int old = ldev->current_effect;
+	int ret;
+
+	if (!ldev->enabled)
+		return 0;
+
+	ldev->current_effect = index;
+	ret = asus_aura_apply_effect(ldev, cdev->brightness);
+	ldev->current_effect = old;
+	return ret;
+}
+
+static int asus_aura_set_enabled(struct led_classdev_dynamic *ldev, bool enabled)
+{
+	struct led_classdev *cdev = led_dynamic_cdev(ldev);
+
+	return asus_aura_apply_effect(ldev, enabled ? cdev->brightness : LED_OFF);
+}
+
+static int asus_aura_set_speed(struct led_classdev_dynamic *ldev,
+			       unsigned int speed)
+{
+	struct led_classdev *cdev = led_dynamic_cdev(ldev);
+	unsigned int old_speed = ldev->speed;
+	int ret;
+
+	ldev->speed = speed;
+	ret = asus_aura_apply_effect(ldev, cdev->brightness);
+	ldev->speed = old_speed;
+	return ret;
+}
+
+static int asus_aura_set_direction(struct led_classdev_dynamic *ldev,
+				   enum dl_direction direction)
+{
+	struct led_classdev *cdev = led_dynamic_cdev(ldev);
+	enum dl_direction old_dir = ldev->direction;
+	int ret;
+
+	ldev->direction = direction;
+	ret = asus_aura_apply_effect(ldev, cdev->brightness);
+	ldev->direction = old_dir;
+	return ret;
+}
+
+static int asus_aura_set_palette(struct led_classdev_dynamic *ldev,
+				 const struct dl_rgb *palette,
+				 unsigned int num_entries)
+{
+	struct led_classdev *cdev = led_dynamic_cdev(ldev);
+	struct dl_rgb saved[2];
+	unsigned int old_n = ldev->num_palette_entries;
+	unsigned int copy_n;
+	int ret;
+
+	if (!palette || !num_entries || num_entries > ldev->max_palette_entries)
+		return -EINVAL;
+
+	copy_n = min_t(unsigned int, old_n, ARRAY_SIZE(saved));
+	if (copy_n)
+		memcpy(saved, ldev->palette, copy_n * sizeof(*saved));
+
+	memcpy(ldev->palette, palette, num_entries * sizeof(*palette));
+	ldev->num_palette_entries = num_entries;
+
+	ret = asus_aura_apply_effect(ldev, cdev->brightness);
+
+	memcpy(ldev->palette, saved, copy_n * sizeof(*saved));
+	ldev->num_palette_entries = old_n;
+	return ret;
+}
+
+static int asus_aura_brightness_set_blocking(struct led_classdev *cdev,
+					     enum led_brightness brightness)
+{
+	struct led_classdev_dynamic *ldev = lcdev_to_dldev(cdev);
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	guard(mutex)(&ldev->lock);
+
+	ret = asus_aura_check_node_active(drvdata, ldev);
+	if (ret < 0)
+		return ret;
+
+	if (brightness == LED_OFF || !ldev->enabled)
+		return asus_aura_apply_effect(ldev, LED_OFF);
+
+	ret = asus_aura_activate_zones(drvdata);
+	if (ret < 0)
+		hid_warn(drvdata->hdev, "Failed to activate Aura hardware zones: %d\n", ret);
+
+	return asus_aura_apply_effect(ldev, brightness);
+}
+
+static int asus_aura_set_power_states(struct led_classdev_dynamic *ldev,
+					u32 active_states)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_POWER,
+		AURA_POWER_CMD_ENABLE,
+	};
+	u8 kbd = 0;
+	u8 lightbar = 0;
+
+	if (active_states & DL_POWER_STATE_BOOT) {
+		kbd |= AURA_POWER_KBD_BOOT;
+		lightbar |= AURA_POWER_LB_BOOT;
+	}
+	if (active_states & DL_POWER_STATE_AWAKE) {
+		kbd |= AURA_POWER_KBD_AWAKE;
+		lightbar |= AURA_POWER_LB_AWAKE;
+	}
+	if (active_states & DL_POWER_STATE_SLEEP) {
+		kbd |= AURA_POWER_KBD_SLEEP;
+		lightbar |= AURA_POWER_LB_SLEEP;
+	}
+	if (active_states & DL_POWER_STATE_SHUTDOWN) {
+		kbd |= AURA_POWER_KBD_SHUTDOWN;
+		lightbar |= AURA_POWER_LB_SHUTDOWN;
+	}
+
+	/*
+	 * Map generic DL boot/awake/sleep/shutdown onto keyboard bits, and also
+	 * lightbar bits when the chassis lightbar is present. Leave lid/rear
+	 * enabled so unmanaged zones are not accidentally gated off.
+	 */
+	buf[3] = kbd | AURA_POWER_MASK_LOGO_ALL;
+	buf[4] = drvdata->has_lightbar ? lightbar : 0;
+	buf[5] = AURA_POWER_MASK_LID_ALL;
+	buf[6] = AURA_POWER_MASK_REAR_ALL;
+
+	return asus_aura_set_feature(drvdata, buf, sizeof(buf));
+}
+
+static const struct led_dynamic_ops asus_aura_ops = {
+	.set_effect	= asus_aura_set_effect,
+	.set_speed	= asus_aura_set_speed,
+	.set_direction	= asus_aura_set_direction,
+	.set_palette	= asus_aura_set_palette,
+	.set_enabled	= asus_aura_set_enabled,
+	.set_power_states = asus_aura_set_power_states,
+	.direct_write	= asus_aura_strix_set_direct,
+};
+
+static const struct led_dynamic_ops asus_aura_lightbar_ops = {
+	.set_effect	= asus_aura_set_effect,
+	.set_speed	= asus_aura_set_speed,
+	.set_direction	= asus_aura_set_direction,
+	.set_palette	= asus_aura_set_palette,
+	.set_enabled	= asus_aura_set_enabled,
+	.set_power_states = asus_aura_set_power_states,
+	.direct_write	= asus_aura_lightbar_set_direct,
+};
+
+static int asus_aura_discover(struct asus_drvdata *drvdata, bool *has_lightbar,
+			      bool *is_strix_4zone, bool *is_per_key)
+{
+	u8 buf[AURA_FEATURE_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1,
+		AURA_CMD_PROBE,
+		0x20,
+		0x31,
+		0x00,
+		0x20,
+	};
+	int ret;
+
+	*has_lightbar = false;
+	*is_strix_4zone = false;
+	*is_per_key = false;
+
+	/*
+	 * Query hardware configuration via Report 0x5D opcode 0x05.
+	 * Byte 9 describes the keyboard layout class (0x02 = 4-zone,
+	 * 0x03 = per-key) and byte 13 is the physical-region bitmap
+	 * (bit 1 = lightbar present).
+	 */
+	ret = asus_aura_set_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	memset(buf, 0, sizeof(buf));
+	buf[0] = FEATURE_KBD_LED_REPORT_ID1;
+	ret = asus_aura_get_feature(drvdata, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+
+	if (ret < 14)
+		return -EPROTO;
+
+	if (buf[1] != AURA_CMD_PROBE || buf[2] != 0x20 || buf[3] != 0x31)
+		return -ENODEV;
+
+	*is_strix_4zone = (buf[9] == 0x02);
+	*is_per_key = (buf[9] == 0x03);
+	*has_lightbar = !!(buf[13] & 0x02);
+
+	return 0;
+}
+
+static const struct asus_slash_mode {
+	const char *name;
+	u8 mode;
+} asus_slash_modes[] = {
+	{ "Static", 0x06 },
+	{ "Bounce", 0x10 },
+	{ "Slash", 0x12 },
+	{ "Loading", 0x13 },
+	{ "BitStream", 0x1d },
+	{ "Transmission", 0x1a },
+	{ "Flow", 0x19 },
+	{ "Flux", 0x25 },
+	{ "Phantom", 0x24 },
+	{ "Spectrum", 0x26 },
+	{ "Hazard", 0x32 },
+	{ "Interfacing", 0x33 },
+	{ "Ramp", 0x34 },
+	{ "GameOver", 0x42 },
+	{ "Start", 0x43 },
+	{ "Buzzer", 0x44 },
+};
+
+static inline u8 asus_slash_report_id(struct asus_drvdata *drvdata)
+{
+	if (asus_has_report_id(drvdata->hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return FEATURE_KBD_LED_REPORT_ID2;
+	return FEATURE_KBD_LED_REPORT_ID1;
+}
+
+static int asus_slash_init_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd7, 0x00, 0x00, 0x01, 0xac };
+	u8 pkt2[] = { rpt, 0xd2, 0x02, 0x01, 0x08, 0xab };
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_set_options_unlocked(struct asus_drvdata *drvdata, bool enabled,
+					  u8 brightness, u8 interval)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = {
+		rpt, 0xd3, 0x03, 0x01, 0x08, 0xab, 0xff, 0x01,
+		enabled ? 1 : 0, 0x06, brightness, 0xff, interval
+	};
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_set_mode_unlocked(struct asus_drvdata *drvdata, u8 mode)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd2, 0x03, 0x00, 0x0c };
+	u8 pkt2[] = {
+		rpt, 0xd3, 0x04, 0x00, 0x0c, 0x01, mode, 0x02,
+		0x19, 0x03, 0x13, 0x04, 0x11, 0x05, 0x12, 0x06, 0x13
+	};
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_save_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = { rpt, 0xd4, 0x00, 0x00, 0x01, 0xab };
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_brightness_set_blocking(struct led_classdev *led_cdev,
+					      enum led_brightness brightness)
+{
+	struct asus_drvdata *drvdata = container_of(led_cdev, struct asus_drvdata, slash_led);
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_brightness = brightness;
+	ret = asus_slash_set_options_unlocked(drvdata, brightness > 0, (u8)brightness,
+					     drvdata->slash_interval);
+	if (ret < 0)
+		return ret;
+
+	return asus_slash_save_unlocked(drvdata);
+}
+
+static ssize_t slash_mode_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (asus_slash_modes[i].mode == drvdata->slash_mode)
+			return sysfs_emit(buf, "%s\n", asus_slash_modes[i].name);
+	}
+
+	return sysfs_emit(buf, "0x%02x\n", drvdata->slash_mode);
+}
+
+static ssize_t slash_mode_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	char mode_str[32];
+	unsigned int i;
+	u8 mode_val = 0;
+	int ret;
+
+	if (sscanf(buf, "%31s", mode_str) != 1)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (sysfs_streq(mode_str, asus_slash_modes[i].name)) {
+			mode_val = asus_slash_modes[i].mode;
+			break;
+		}
+	}
+
+	if (!mode_val) {
+		if (kstrtou8(mode_str, 0, &mode_val))
+			return -EINVAL;
+	}
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	ret = asus_slash_set_mode_unlocked(drvdata, mode_val);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	drvdata->slash_mode = mode_val;
+	return count;
+}
+static DEVICE_ATTR_RW(slash_mode);
+
+static ssize_t slash_mode_index_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf,
+			  "Static Bounce Slash Loading BitStream Transmission Flow Flux Phantom Spectrum Hazard Interfacing Ramp GameOver Start Buzzer\n");
+}
+static DEVICE_ATTR_RO(slash_mode_index);
+
+static ssize_t slash_interval_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+
+	return sysfs_emit(buf, "%u\n", drvdata->slash_interval);
+}
+
+static ssize_t slash_interval_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	u8 interval;
+	int ret;
+
+	if (kstrtou8(buf, 0, &interval))
+		return -EINVAL;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_interval = interval;
+	ret = asus_slash_set_options_unlocked(drvdata, drvdata->slash_brightness > 0,
+					     drvdata->slash_brightness, interval);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(slash_interval);
+
+static struct attribute *asus_slash_attrs[] = {
+	&dev_attr_slash_mode.attr,
+	&dev_attr_slash_mode_index.attr,
+	&dev_attr_slash_interval.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_slash_group = {
+	.attrs = asus_slash_attrs,
+};
+
+static const struct attribute_group *asus_slash_groups[] = {
+	&asus_slash_group,
+	NULL,
+};
+
+static int asus_init_slash(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	int ret;
+
+	if (!asus_device_has_slash(hdev))
+		return 0;
+
+	drvdata->slash_led.name = "asus::slash";
+	drvdata->slash_led.max_brightness = 255;
+	drvdata->slash_led.brightness = 255;
+	drvdata->slash_led.brightness_set_blocking = asus_slash_brightness_set_blocking;
+	drvdata->slash_led.groups = asus_slash_groups;
+
+	drvdata->slash_brightness = 255;
+	drvdata->slash_interval = 0;
+	drvdata->slash_mode = 0x19;
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_slash_init_unlocked(drvdata);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to initialize Slash lighting: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = devm_led_classdev_register(&hdev->dev, &drvdata->slash_led);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register Slash LED classdev: %d\n", ret);
+		return ret;
+	}
+
+	drvdata->has_slash_led = true;
+	hid_info(hdev, "Registered Slash lighting LED: asus::slash\n");
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		asus_slash_set_options_unlocked(drvdata, true, 255, 0);
+		asus_slash_set_mode_unlocked(drvdata, 0x19);
+		asus_slash_save_unlocked(drvdata);
+	}
+
+	return 0;
+}
+
+static void asus_aura_dldev_set_default_palette(struct led_classdev_dynamic *ldev)
+{
+	if (!ldev->palette)
+		return;
+
+	ldev->palette[0].r = 255;
+	ldev->palette[0].g = 0;
+	ldev->palette[0].b = 0;
+	ldev->num_palette_entries = 1;
+}
+
+static void asus_aura_dldev_common_init(struct led_classdev_dynamic *ldev,
+					struct asus_drvdata *drvdata,
+					const char *name,
+					const struct led_dynamic_ops *ops,
+					const char **effects,
+					unsigned int num_effects)
+{
+	unsigned int i;
+
+	ldev->cdev.name = name;
+	ldev->cdev.max_brightness = 255;
+	ldev->cdev.brightness = 255;
+	ldev->cdev.brightness_set_blocking = asus_aura_brightness_set_blocking;
+	ldev->cdev.groups = asus_aura_groups;
+	ldev->ops = ops;
+	ldev->driver_data = drvdata;
+	ldev->speed = 1;
+	ldev->speed_min = 0;
+	ldev->speed_max = 2;
+	ldev->direction = DL_DIRECTION_RIGHT;
+	ldev->supported_directions = BIT(DL_DIRECTION_RIGHT) |
+				     BIT(DL_DIRECTION_LEFT);
+	ldev->max_palette_entries = 2;
+	ldev->effects = (const char * const *)effects;
+	ldev->num_effects = num_effects;
+	ldev->current_effect = 0;
+	for (i = 0; i < num_effects; i++) {
+		if (!strcmp(effects[i], "static")) {
+			ldev->current_effect = i;
+			break;
+		}
+	}
+	ldev->supported_power_states = DL_POWER_STATE_ALL;
+	ldev->active_power_states = DL_POWER_STATE_ALL;
+}
+
+static int asus_init_dynamic_lighting(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	unsigned int global_n, kbd_n, lightbar_n;
+	u8 effect_mask[2];
+	const u8 *mask = NULL;
+	bool is_per_key = false;
+	bool has_lightbar = false;
+	bool kbd_direct;
+	bool lightbar_direct;
+	int ret;
+
+	ret = asus_aura_discover(drvdata, &has_lightbar, &drvdata->is_strix_4zone,
+				 &is_per_key);
+	if (ret == -ENODEV)
+		return 0;
+	if (ret < 0) {
+		hid_warn(hdev, "Aura device discovery failed: %d\n", ret);
+		return 0;
+	}
+
+	asus_aura_init_direct_bufs(drvdata);
+
+	ret = asus_aura_wake_all_zones(drvdata);
+	if (ret < 0)
+		hid_warn(hdev, "Failed to wake Aura hardware zones: %d\n", ret);
+
+	scoped_guard(mutex, &drvdata->aura_lock)
+		asus_lamparray_try_init_unlocked(drvdata);
+
+	kbd_direct = is_per_key || drvdata->is_strix_4zone ||
+		     drvdata->lamparray_hdev != NULL;
+	lightbar_direct = has_lightbar;
+	ret = asus_aura_get_effect_mask(drvdata, effect_mask);
+	if (ret < 0) {
+		hid_warn(hdev,
+			 "Aura 0x9e capability probe failed: %d, using fallback effect list\n",
+			 ret);
+	} else {
+		mask = effect_mask;
+	}
+
+	kbd_n = asus_aura_fill_effects(drvdata->effects_kbd, mask, kbd_direct);
+	lightbar_n = asus_aura_fill_effects(drvdata->effects_lightbar, mask,
+					    lightbar_direct);
+	global_n = asus_aura_fill_effects(drvdata->effects_global, mask, kbd_direct);
+
+	drvdata->has_lightbar = has_lightbar;
+	drvdata->aura_mode = AURA_MODE_AUTO;
+
+	/* Keyboard Dynamic Lighting zone: always registered on Aura models. */
+	asus_aura_dldev_common_init(&drvdata->dldev_kbd, drvdata, "aura:keyboard",
+				    &asus_aura_ops,
+				    drvdata->effects_kbd, kbd_n);
+	if (kbd_direct) {
+		drvdata->dldev_kbd.zone_type = drvdata->is_strix_4zone ?
+			"keyboard" : "keyboard_per_key";
+		drvdata->dldev_kbd.led_count = drvdata->is_strix_4zone ?
+			ROG_STRIX_4ZONE_KBD_LEDS : ROG_STRIX_DIRECT_LEDS;
+	} else {
+		drvdata->dldev_kbd.zone_type = "keyboard";
+		if (drvdata->is_strix_4zone)
+			drvdata->dldev_kbd.led_count = ROG_STRIX_4ZONE_KBD_LEDS;
+	}
+
+	ret = devm_led_classdev_dynamic_register(&hdev->dev, &drvdata->dldev_kbd);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register kbd dynamic lighting: %d\n", ret);
+		return ret;
+	}
+	drvdata->has_dldev_kbd = true;
+	asus_aura_dldev_set_default_palette(&drvdata->dldev_kbd);
+
+	if (has_lightbar) {
+		asus_aura_dldev_common_init(&drvdata->dldev_lightbar, drvdata,
+					    "aura:lightbar",
+					    &asus_aura_lightbar_ops,
+					    drvdata->effects_lightbar, lightbar_n);
+		drvdata->dldev_lightbar.zone_type = "lightbar";
+		drvdata->dldev_lightbar.led_count = asus_aura_lb_led_count(drvdata);
+
+		ret = devm_led_classdev_dynamic_register(&hdev->dev,
+							 &drvdata->dldev_lightbar);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to register lightbar dynamic lighting: %d\n",
+				 ret);
+		} else {
+			drvdata->has_dldev_lightbar = true;
+			asus_aura_dldev_set_default_palette(&drvdata->dldev_lightbar);
+		}
+
+		asus_aura_dldev_common_init(&drvdata->dldev_global, drvdata,
+					    "aura:global",
+					    &asus_aura_ops,
+					    drvdata->effects_global, global_n);
+		drvdata->dldev_global.zone_type = "global";
+		if (kbd_direct) {
+			drvdata->dldev_global.led_count = drvdata->is_strix_4zone ?
+				ROG_STRIX_4ZONE_KBD_LEDS : ROG_STRIX_DIRECT_LEDS;
+		} else if (drvdata->is_strix_4zone) {
+			drvdata->dldev_global.led_count = ROG_STRIX_4ZONE_KBD_LEDS;
+		}
+
+		ret = devm_led_classdev_dynamic_register(&hdev->dev,
+							 &drvdata->dldev_global);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to register global dynamic lighting: %d\n",
+				 ret);
+		} else {
+			drvdata->has_dldev_global = true;
+			asus_aura_dldev_set_default_palette(&drvdata->dldev_global);
+		}
+	}
+
+	hid_info(hdev, "Registered dynamic lighting zones: global=%d, kbd=%d, lightbar=%d\n",
+		 drvdata->has_dldev_global, drvdata->has_dldev_kbd,
+		 drvdata->has_dldev_lightbar);
+
+	/* Apply initial default static effect to illuminate active zones */
+	if (asus_aura_effective_mode(drvdata) == AURA_MODE_UNIFIED) {
+		if (drvdata->has_dldev_global)
+			asus_aura_apply_effect(&drvdata->dldev_global,
+					       drvdata->dldev_global.cdev.brightness);
+	} else {
+		if (drvdata->has_dldev_kbd)
+			asus_aura_apply_effect(&drvdata->dldev_kbd,
+					       drvdata->dldev_kbd.cdev.brightness);
+		if (drvdata->has_dldev_lightbar)
+			asus_aura_apply_effect(&drvdata->dldev_lightbar,
+					       drvdata->dldev_lightbar.cdev.brightness);
+	}
+
+	return 0;
+}
+
+#else /* !IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC) */
+
+static inline int asus_init_dynamic_lighting(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static inline int asus_init_slash(struct hid_device *hdev)
+{
+	return 0;
+}
+
+#endif /* IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC) */
 
 /*
  * [0]       REPORT_ID (same value defined in report descriptor)
@@ -1365,6 +3469,11 @@ static int __maybe_unused asus_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (drvdata->has_dldev_kbd || drvdata->has_dldev_global)
+		asus_aura_restore(drvdata);
+#endif
+
 	/*
 	 * If we have a backlight listener registered, restore the previous state,
 	 * in case of error do not fail: most models restore the backlight
@@ -1379,6 +3488,11 @@ static int __maybe_unused asus_resume(struct hid_device *hdev)
 static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (drvdata->has_dldev_kbd || drvdata->has_dldev_global)
+		asus_aura_restore(drvdata);
+#endif
 
 	if (drvdata->tp)
 		return asus_start_multitouch(hdev);
@@ -1399,6 +3513,17 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return -ENOMEM;
 
 	hid_set_drvdata(hdev, drvdata);
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	ret = devm_mutex_init(&hdev->dev, &drvdata->aura_lock);
+	if (ret)
+		return ret;
+
+	drvdata->aura_buf = devm_kzalloc(&hdev->dev, AURA_FEATURE_REPORT_SIZE,
+					 GFP_KERNEL);
+	if (!drvdata->aura_buf)
+		return -ENOMEM;
+#endif
 
 	drvdata->quirks = id->driver_data;
 
@@ -1474,6 +3599,18 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
+	/*
+	 * USB 0x193b is reused by AniMe Matrix. Bind only LampArray or
+	 * interfaces that expose Aura/Slash LED reports.
+	 */
+	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
+	    !asus_is_lamparray_interface(hdev) &&
+	    !asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) &&
+	    !asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
+		hid_dbg(hdev, "Skipping 0x193b without Aura/Slash LED reports\n");
+		return -ENODEV;
+	}
+
 	/* Check for vendor for RGB init and handle generic devices properly. */
 	rep_enum = &hdev->report_enum[HID_INPUT_REPORT];
 	list_for_each_entry(rep, &rep_enum->report_list, list) {
@@ -1488,6 +3625,23 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	 */
 	if (is_vendor && (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD))
 		hdev->quirks |= HID_QUIRK_HIDINPUT_FORCE;
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	/*
+	 * LampArray is a Dynamic Lighting backend owned in-kernel: do not
+	 * export hidraw for that interface. Aura 0xBC remains the fallback
+	 * when LampArray is absent.
+	 */
+	if (asus_is_lamparray_interface(hdev)) {
+		ret = hid_hw_start(hdev, 0);
+		if (ret) {
+			hid_err(hdev, "Asus LampArray hw start failed: %d\n", ret);
+			return ret;
+		}
+		hid_info(hdev, "Bound ASUS LampArray interface (no hidraw)\n");
+		return 0;
+	}
+#endif
 
 	ret = asus_worker_create(hdev, drvdata);
 	if (ret) {
@@ -1518,6 +3672,17 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	    (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID)) &&
 		(asus_kbd_register_leds(hdev)))
 		hid_warn(hdev, "Failed to initialize backlight.\n");
+
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
+	    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
+		ret = asus_init_dynamic_lighting(hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to initialize dynamic lighting: %d\n", ret);
+
+		ret = asus_init_slash(hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to initialize Slash lighting: %d\n", ret);
+	}
 
 	/*
 	 * For ROG keyboards, skip rename for consistency and ->input check as
@@ -1561,6 +3726,24 @@ static void asus_remove(struct hid_device *hdev)
 
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
+
+#if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
+	if (asus_is_lamparray_interface(hdev)) {
+		asus_lamparray_unbind_from_owners(hdev);
+		hid_hw_stop(hdev);
+		return;
+	}
+	if (drvdata->lamparray_hdev) {
+		scoped_guard(mutex, &drvdata->aura_lock) {
+			asus_lamparray_release_unlocked(drvdata);
+			if (drvdata->lamparray_hdev) {
+				put_device(&drvdata->lamparray_hdev->dev);
+				drvdata->lamparray_hdev = NULL;
+			}
+			drvdata->lamparray_count = 0;
+		}
+	}
+#endif
 
 	asus_worker_stop(drvdata->worker);
 	hid_hw_stop(hdev);
@@ -1698,6 +3881,9 @@ static const struct hid_device_id asus_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+	    USB_DEVICE_ID_ASUSTEK_ROG_SLASH),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD2),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
