@@ -7060,6 +7060,10 @@ Kernel parameters
 	shapers=	[NET]
 			Maximal number of shapers.
 
+	shutdown=legacy [KNL]
+			Use the legacy device shutdown callbacks when powering off
+			the system instead of the hibernation power-off callbacks.
+
 	show_lapic=	[APIC,X86] Advanced Programmable Interrupt Controller
 			Limit apic dumping. The parameter defines the maximal
 			number of local apics being dumped. Also it is possible

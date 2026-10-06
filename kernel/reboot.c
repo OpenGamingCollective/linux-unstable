@@ -69,6 +69,7 @@ struct sys_off_handler {
  * of that.
  */
 static bool poweroff_fallback_to_halt;
+static bool shutdown_legacy;
 
 /*
  * Temporary stub that prevents linkage failure while we're in process
@@ -308,7 +309,7 @@ static void kernel_shutdown_prepare(enum system_states state)
 	system_state = state;
 	usermodehelper_disable();
 #ifdef CONFIG_HIBERNATE_CALLBACKS
-	if (state == SYSTEM_POWER_OFF) {
+	if (state == SYSTEM_POWER_OFF && !shutdown_legacy) {
 		if (!dpm_suspend_start(PMSG_POWEROFF) && !dpm_suspend_end(PMSG_POWEROFF))
 			return;
 		pr_emerg("Failed to power off devices, using shutdown instead.\n");
@@ -1102,6 +1103,13 @@ static ssize_t hw_protection_store(struct kobject *kobj,
 }
 static struct kobj_attribute hw_protection_attr = __ATTR_RW(hw_protection);
 #endif
+
+static int __init shutdown_setup(char *str)
+{
+	shutdown_legacy = true;
+	return 1;
+}
+__setup("shutdown=legacy", shutdown_setup);
 
 static int __init reboot_setup(char *str)
 {
