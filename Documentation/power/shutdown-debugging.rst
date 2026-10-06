@@ -33,13 +33,18 @@ some potential options include:
 
 Kernel Command-line Parameters
 ==============================
-Add these parameters to your kernel command line:
+Add these parameters to your kernel command line to capture shutdown logs:
 
 * ``printk.always_kmsg_dump=Y``
 	* Forces the kernel to dump the entire message buffer to pstore during
 		shutdown
 * ``efi_pstore.pstore_disable=N``
 	* For EFI-based systems, ensures the EFI backend is active
+
+If the system fails while running the hibernation power-off callbacks, add
+``shutdown=legacy`` to use the legacy device shutdown callbacks instead. This
+can be used to work around the failure and confirm which callback flow caused
+it.
 
 Userspace Interaction and Log Retrieval
 =======================================
