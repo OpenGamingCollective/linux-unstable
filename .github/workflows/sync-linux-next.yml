@@ -47,8 +47,11 @@ jobs:
           # Anchor: the empty marker commit "ogc: linux-unstable: first
           # commit" is always the first fork commit ever made. Its parent is
           # therefore the upstream snapshot the fork was built on.
+          #
+          # Match the subject suffix so a leading tag such as
+          # [NOT-FOR-UPSTREAM] (added by earlier replays) still finds it.
           # ------------------------------------------------------------------
-          MARKER="$(git log --format="%H" --grep="^ogc: linux-unstable: first commit$" master)"
+          MARKER="$(git log --format="%H" --grep="ogc: linux-unstable: first commit$" master | head -n1)"
           if [ -z "$MARKER" ]; then
             echo "::error::Could not find the 'ogc: linux-unstable: first commit' marker; refusing to touch master."
             exit 1
