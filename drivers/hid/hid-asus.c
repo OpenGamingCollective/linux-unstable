@@ -67,10 +67,25 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define ASUS_AURA_MAX_EFFECTS		13
 
 /*
- * USB 0x193b is shared by Slash and AniMe Matrix. AniMe uses ~640-byte
- * feature reports on 0x5e; Slash uses shorter Aura-sized reports.
+ * AniMe Matrix (USB 0x193b, feature report 0x5e). Packet layout and DMI
+ * board matching follow asusctl rog-anime / reverse-engineering notes.
  */
 #define ASUS_ANIME_PACKET_SIZE		640
+#define ASUS_ANIME_BLOCK_START		7
+#define ASUS_ANIME_BLOCK_END		634
+#define ASUS_ANIME_PANE_LEN		(ASUS_ANIME_BLOCK_END - ASUS_ANIME_BLOCK_START)
+#define ASUS_ANIME_STRIX_PANE1_LEN	490
+#define ASUS_ANIME_MAX_LEDS		(ASUS_ANIME_PANE_LEN * 3)
+#define ASUS_ANIME_MAX_EFFECTS		9
+
+enum asus_anime_type {
+	ASUS_ANIME_GA401 = 0,
+	ASUS_ANIME_GA402,
+	ASUS_ANIME_GU604,
+	ASUS_ANIME_G635L,
+	ASUS_ANIME_G835L,
+	ASUS_ANIME_UNKNOWN,
+};
 
 enum asus_pid_193b_kind {
 	ASUS_PID_193B_NONE = 0,
@@ -389,6 +404,16 @@ struct asus_drvdata {
 	bool lamparray_controlled;
 	bool lamparray_unavailable;
 	struct asus_lamparray_lamp *lamparray_lamps;
+	struct led_classdev_dynamic dldev_anime;
+	const char *effects_anime[ASUS_ANIME_MAX_EFFECTS];
+	bool has_dldev_anime;
+	enum asus_anime_type anime_type;
+	u8 anime_boot;
+	u8 anime_awake;
+	u8 anime_sleep;
+	u8 anime_shutdown;
+	bool anime_builtin;
+	u8 *anime_buf;
 #endif
 };
 
@@ -1272,6 +1297,27 @@ static bool asus_dmi_is_slash_only_board(void)
 	       strstr(board, "G614JV") || strstr(board, "G614PR");
 }
 
+static enum asus_anime_type asus_anime_type_from_dmi(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	if (!board)
+		return ASUS_ANIME_UNKNOWN;
+
+	if (strstr(board, "GA401I") || strstr(board, "GA401Q"))
+		return ASUS_ANIME_GA401;
+	if (strstr(board, "GA402R") || strstr(board, "GA402X") ||
+	    strstr(board, "GA402N"))
+		return ASUS_ANIME_GA402;
+	if (strstr(board, "GU604V"))
+		return ASUS_ANIME_GU604;
+	if (strstr(board, "G635L"))
+		return ASUS_ANIME_G635L;
+	if (strstr(board, "G835L"))
+		return ASUS_ANIME_G835L;
+
+	return ASUS_ANIME_UNKNOWN;
+}
 
 /*
  * USB 0x193b is shared by Slash and AniMe Matrix. Discriminate in order:
@@ -3442,6 +3488,397 @@ static int asus_init_dynamic_lighting(struct hid_device *hdev)
 	return 0;
 }
 
+static unsigned int asus_anime_led_count(enum asus_anime_type type)
+{
+	switch (type) {
+	case ASUS_ANIME_GA401:
+		return ASUS_ANIME_PANE_LEN * 2;
+	case ASUS_ANIME_G635L:
+	case ASUS_ANIME_G835L:
+		return 810;
+	case ASUS_ANIME_GA402:
+	case ASUS_ANIME_GU604:
+	case ASUS_ANIME_UNKNOWN:
+	default:
+		/* Safe GA402-like 3-pane layout for unknown AniMe boards. */
+		return ASUS_ANIME_PANE_LEN * 3;
+	}
+}
+
+static unsigned int asus_anime_pane_count(enum asus_anime_type type)
+{
+	switch (type) {
+	case ASUS_ANIME_GA401:
+	case ASUS_ANIME_G635L:
+	case ASUS_ANIME_G835L:
+		return 2;
+	default:
+		return 3;
+	}
+}
+
+static void asus_anime_fill_prefix(enum asus_anime_type type, unsigned int pane,
+				   u8 *hdr)
+{
+	static const u8 ga_pfx[3][7] = {
+		{ 0x5e, 0xc0, 0x02, 0x01, 0x00, 0x73, 0x02 },
+		{ 0x5e, 0xc0, 0x02, 0x74, 0x02, 0x73, 0x02 },
+		{ 0x5e, 0xc0, 0x02, 0xe7, 0x04, 0x73, 0x02 },
+	};
+	static const u8 strix_pfx[2][7] = {
+		{ 0x5e, 0xc0, 0x02, 0x01, 0x00, 0xea, 0x01 },
+		{ 0x5e, 0xc0, 0x02, 0xeb, 0x01, 0x40, 0x01 },
+	};
+
+	if (type == ASUS_ANIME_G635L || type == ASUS_ANIME_G835L) {
+		memcpy(hdr, strix_pfx[min_t(unsigned int, pane, 1)], 7);
+		return;
+	}
+
+	memcpy(hdr, ga_pfx[min_t(unsigned int, pane, 2)], 7);
+}
+
+static int asus_anime_write(struct asus_drvdata *drvdata, u8 *buf, size_t len)
+{
+	int ret;
+
+	if (!buf || len < 1 || len > ASUS_ANIME_PACKET_SIZE)
+		return -EINVAL;
+
+	ret = hid_hw_raw_request(drvdata->hdev, buf[0], buf, len,
+				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static int asus_anime_clear_pkt(struct asus_drvdata *drvdata)
+{
+	memset(drvdata->anime_buf, 0, ASUS_ANIME_PACKET_SIZE);
+	drvdata->anime_buf[0] = FEATURE_KBD_LED_REPORT_ID2;
+	return 0;
+}
+
+static int asus_anime_init_device(struct asus_drvdata *drvdata)
+{
+	static const char *asus_tech = "ASUS Tech.Inc.";
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	memcpy(drvdata->anime_buf + 1, asus_tech, strlen(asus_tech));
+	ret = asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc2;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_flush(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc0;
+	drvdata->anime_buf[2] = 0x03;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_set_brightness(struct asus_drvdata *drvdata, u8 brightness)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc0;
+	drvdata->anime_buf[2] = 0x04;
+	drvdata->anime_buf[3] = brightness;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_set_display(struct asus_drvdata *drvdata, bool enabled)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc3;
+	drvdata->anime_buf[2] = 0x01;
+	drvdata->anime_buf[3] = enabled ? 0x00 : 0x80;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_set_powersave_anim(struct asus_drvdata *drvdata, bool enabled)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc4;
+	drvdata->anime_buf[2] = 0x01;
+	drvdata->anime_buf[3] = enabled ? 0x00 : 0x80;
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_commit_builtins(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	ret = asus_anime_clear_pkt(drvdata);
+	if (ret)
+		return ret;
+
+	drvdata->anime_buf[1] = 0xc5;
+	drvdata->anime_buf[2] = drvdata->anime_awake |
+				(drvdata->anime_sleep << 1) |
+				(drvdata->anime_shutdown << 2) |
+				(drvdata->anime_boot << 3);
+	return asus_anime_write(drvdata, drvdata->anime_buf, ASUS_ANIME_PACKET_SIZE);
+}
+
+static int asus_anime_write_frame(struct asus_drvdata *drvdata,
+				  const u8 *data, size_t len)
+{
+	unsigned int panes = asus_anime_pane_count(drvdata->anime_type);
+	unsigned int pane, offset = 0;
+	int ret;
+
+	if (len != asus_anime_led_count(drvdata->anime_type))
+		return -EINVAL;
+
+	for (pane = 0; pane < panes; pane++) {
+		unsigned int chunk;
+
+		ret = asus_anime_clear_pkt(drvdata);
+		if (ret)
+			return ret;
+
+		asus_anime_fill_prefix(drvdata->anime_type, pane,
+				       drvdata->anime_buf);
+
+		if (drvdata->anime_type == ASUS_ANIME_G635L ||
+		    drvdata->anime_type == ASUS_ANIME_G835L) {
+			chunk = pane ? (len - ASUS_ANIME_STRIX_PANE1_LEN) :
+				       ASUS_ANIME_STRIX_PANE1_LEN;
+		} else {
+			chunk = min_t(unsigned int, ASUS_ANIME_PANE_LEN, len - offset);
+		}
+
+		if (offset + chunk > len)
+			return -EINVAL;
+
+		memcpy(drvdata->anime_buf + ASUS_ANIME_BLOCK_START,
+		       data + offset, chunk);
+		offset += chunk;
+
+		ret = asus_anime_write(drvdata, drvdata->anime_buf,
+				       ASUS_ANIME_PACKET_SIZE);
+		if (ret < 0)
+			return ret;
+	}
+
+	return asus_anime_flush(drvdata);
+}
+
+static const char * const asus_anime_effect_names[] = {
+	"direct",
+	"glitch_construction",
+	"static_emergence",
+	"binary_banner_scroll",
+	"rog_logo_glitch",
+	"banner_swipe",
+	"starfield",
+	"glitch_out",
+	"see_ya",
+};
+
+static int asus_anime_apply_effect_unlocked(struct asus_drvdata *drvdata,
+					    unsigned int index)
+{
+	int ret;
+
+	if (index >= ARRAY_SIZE(asus_anime_effect_names))
+		return -EINVAL;
+
+	if (index == 0) {
+		drvdata->anime_builtin = false;
+		return asus_anime_set_powersave_anim(drvdata, false);
+	}
+
+	switch (index) {
+	case 1:
+		drvdata->anime_boot = 0;
+		break;
+	case 2:
+		drvdata->anime_boot = 1;
+		break;
+	case 3:
+		drvdata->anime_awake = 0;
+		break;
+	case 4:
+		drvdata->anime_awake = 1;
+		break;
+	case 5:
+		drvdata->anime_sleep = 0;
+		break;
+	case 6:
+		drvdata->anime_sleep = 1;
+		break;
+	case 7:
+		drvdata->anime_shutdown = 0;
+		break;
+	case 8:
+		drvdata->anime_shutdown = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	drvdata->anime_builtin = true;
+	ret = asus_anime_commit_builtins(drvdata);
+	if (ret < 0)
+		return ret;
+
+	return asus_anime_set_powersave_anim(drvdata, true);
+}
+
+static int asus_anime_set_effect(struct led_classdev_dynamic *ldev,
+				 unsigned int index)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&drvdata->aura_lock);
+	return asus_anime_apply_effect_unlocked(drvdata, index);
+}
+
+static int asus_anime_set_enabled(struct led_classdev_dynamic *ldev, bool enabled)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&drvdata->aura_lock);
+	return asus_anime_set_display(drvdata, enabled);
+}
+
+static int asus_anime_direct_write(struct led_classdev_dynamic *ldev,
+				   const u8 *buffer, size_t size)
+{
+	struct asus_drvdata *drvdata = ldev->driver_data;
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	ret = asus_anime_write_frame(drvdata, buffer, size);
+	if (ret < 0)
+		return ret;
+
+	drvdata->anime_builtin = false;
+	return asus_anime_set_powersave_anim(drvdata, false);
+}
+
+static int asus_anime_brightness_set(struct led_classdev *cdev,
+				     enum led_brightness brightness)
+{
+	struct led_classdev_dynamic *ldev = lcdev_to_dldev(cdev);
+	struct asus_drvdata *drvdata = ldev->driver_data;
+
+	guard(mutex)(&drvdata->aura_lock);
+	return asus_anime_set_brightness(drvdata, brightness);
+}
+
+static const struct led_dynamic_ops asus_anime_ops = {
+	.set_effect = asus_anime_set_effect,
+	.set_enabled = asus_anime_set_enabled,
+	.direct_write = asus_anime_direct_write,
+};
+
+static int asus_init_anime(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct led_classdev_dynamic *ldev = &drvdata->dldev_anime;
+	unsigned int i, led_count;
+	int ret;
+
+	if (asus_classify_pid_193b(hdev) != ASUS_PID_193B_ANIME)
+		return 0;
+
+	drvdata->anime_buf = devm_kzalloc(&hdev->dev, ASUS_ANIME_PACKET_SIZE,
+					  GFP_KERNEL);
+	if (!drvdata->anime_buf)
+		return -ENOMEM;
+
+	drvdata->anime_type = asus_anime_type_from_dmi();
+	if (drvdata->anime_type == ASUS_ANIME_UNKNOWN) {
+		drvdata->anime_type = ASUS_ANIME_GA402;
+		hid_info(hdev,
+			 "AniMe Matrix on unknown board; using GA402-like 3-pane layout\n");
+	}
+
+	led_count = asus_anime_led_count(drvdata->anime_type);
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_anime_init_device(drvdata);
+		if (ret < 0) {
+			hid_warn(hdev, "AniMe Matrix init failed: %d\n", ret);
+			return ret;
+		}
+
+		ret = asus_anime_set_display(drvdata, true);
+		if (ret < 0)
+			return ret;
+
+		ret = asus_anime_set_brightness(drvdata, 2);
+		if (ret < 0)
+			return ret;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(asus_anime_effect_names); i++)
+		drvdata->effects_anime[i] = asus_anime_effect_names[i];
+
+	ldev->cdev.name = "asus::anime";
+	ldev->cdev.max_brightness = 3;
+	ldev->cdev.brightness = 2;
+	ldev->cdev.brightness_set_blocking = asus_anime_brightness_set;
+	ldev->ops = &asus_anime_ops;
+	ldev->driver_data = drvdata;
+	ldev->zone_type = "matrix";
+	ldev->led_count = led_count;
+	ldev->direct_sample_size = 1;
+	ldev->effects = drvdata->effects_anime;
+	ldev->num_effects = ARRAY_SIZE(asus_anime_effect_names);
+	ldev->current_effect = 0;
+	ldev->enabled = true;
+
+	ret = devm_led_classdev_dynamic_register(&hdev->dev, ldev);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register AniMe Dynamic Lighting: %d\n",
+			 ret);
+		return ret;
+	}
+
+	drvdata->has_dldev_anime = true;
+	hid_info(hdev,
+		 "Registered AniMe Matrix Dynamic Lighting (%u LEDs, type %u)\n",
+		 led_count, drvdata->anime_type);
+	return 0;
+}
+
 #else /* !IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC) */
 
 static inline int asus_init_dynamic_lighting(struct hid_device *hdev)
@@ -3454,6 +3891,10 @@ static inline int asus_init_slash(struct hid_device *hdev)
 	return 0;
 }
 
+static inline int asus_init_anime(struct hid_device *hdev)
+{
+	return 0;
+}
 
 static inline void asus_aura_capture_boot_effect(struct hid_device *hdev)
 {
@@ -4068,16 +4509,15 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	/*
 	 * USB 0x193b is shared by Slash and AniMe Matrix. LampArray siblings
-	 * bind as usual. Claim Slash only; refuse AniMe and ambiguous
-	 * interfaces (AniMe support is a separate change).
+	 * bind as usual; otherwise require a positive Slash/AniMe classification.
 	 */
 	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
 	    !asus_is_lamparray_interface(hdev)) {
 		enum asus_pid_193b_kind kind = asus_classify_pid_193b(hdev);
 
-		if (kind != ASUS_PID_193B_SLASH) {
+		if (kind == ASUS_PID_193B_NONE) {
 			hid_dbg(hdev,
-				"Skipping 0x193b (not Slash; kind=%d)\n", kind);
+				"Skipping ambiguous 0x193b (not Slash/AniMe)\n");
 			return -ENODEV;
 		}
 	}
@@ -4127,45 +4567,52 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
-	/*
-	 * Read any committed Aura effect before the keyboard handshake
-	 * overwrites the feature report.
-	 */
-	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1))
-		asus_aura_capture_boot_effect(hdev);
+	if (asus_classify_pid_193b(hdev) == ASUS_PID_193B_ANIME) {
+		ret = asus_init_anime(hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to initialize AniMe Matrix: %d\n",
+				 ret);
+	} else {
+		/*
+		 * Read any committed Aura effect before the keyboard handshake
+		 * overwrites the feature report. Skip on AniMe Matrix.
+		 */
+		if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1))
+			asus_aura_capture_boot_effect(hdev);
 
-	if (!drvdata->tp)
-		asus_initialize_reports(hdev);
+		if (!drvdata->tp)
+			asus_initialize_reports(hdev);
 
-	if (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID) &&
-	    ((hdev->product == USB_DEVICE_ID_ASUSTEK_XGM_2022) ||
-	     (hdev->product == USB_DEVICE_ID_ASUSTEK_XGM_2023))) {
-		ret = asus_xgm_init(hdev, drvdata);
-		if (ret) {
-			hid_err(hdev, "Failed to initialize xg mobile: %d\n", ret);
-			goto err_stop_hw;
+		if (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID) &&
+		    ((hdev->product == USB_DEVICE_ID_ASUSTEK_XGM_2022) ||
+		     (hdev->product == USB_DEVICE_ID_ASUSTEK_XGM_2023))) {
+			ret = asus_xgm_init(hdev, drvdata);
+			if (ret) {
+				hid_err(hdev, "Failed to initialize xg mobile: %d\n", ret);
+				goto err_stop_hw;
+			}
 		}
-	}
 
-	/* Laptops keyboard backlight is always at 0x5a */
-	if (is_vendor && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
-	    (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID)) &&
-	    (asus_kbd_register_leds(hdev)))
-		hid_warn(hdev, "Failed to initialize backlight.\n");
+		/* Laptops keyboard backlight is always at 0x5a */
+		if (is_vendor && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
+		    (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID)) &&
+		    (asus_kbd_register_leds(hdev)))
+			hid_warn(hdev, "Failed to initialize backlight.\n");
 
-	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
-	    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
-		ret = asus_init_dynamic_lighting(hdev);
-		if (ret < 0)
-			hid_warn(hdev,
-				 "Failed to initialize dynamic lighting: %d\n",
-				 ret);
+		if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
+		    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
+			ret = asus_init_dynamic_lighting(hdev);
+			if (ret < 0)
+				hid_warn(hdev,
+					 "Failed to initialize dynamic lighting: %d\n",
+					 ret);
 
-		ret = asus_init_slash(hdev);
-		if (ret < 0)
-			hid_warn(hdev,
-				 "Failed to initialize Slash lighting: %d\n",
-				 ret);
+			ret = asus_init_slash(hdev);
+			if (ret < 0)
+				hid_warn(hdev,
+					 "Failed to initialize Slash lighting: %d\n",
+					 ret);
+		}
 	}
 
 	/*

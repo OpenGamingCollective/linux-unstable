@@ -24,5 +24,18 @@ Description:	ASUS ROG Slash LED class device. Exposes brightness together with
 		``slash_mode``, ``slash_mode_index``, and ``slash_interval``
 		attributes. On Aura keyboards Slash uses feature report 0x5e.
 		USB ID 0x193b is shared with AniMe Matrix; the driver claims it
-		for Slash only when feature report 0x5e size and DMI board
-		discrimination select Slash rather than AniMe.
+		for Slash only when report size and DMI discrimination select
+		Slash rather than AniMe.
+
+What:		/sys/class/leds/asus::anime/
+Date:		October 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	ASUS AniMe Matrix Dynamic Lighting node (USB 0x193b when
+		discriminated as AniMe). ``brightness`` is the firmware
+		display level (0-3). ``enabled`` maps to display on/off.
+		``effect`` selects ``direct`` streaming or a builtin stage
+		animation (boot/awake/sleep/shutdown enums). ``direct_buffer``
+		accepts one intensity byte per LED; ``led_count`` matches the
+		board layout (GA401, GA402, GU604, G635L, G835L). Unknown
+		AniMe boards use a GA402-like three-pane layout.
