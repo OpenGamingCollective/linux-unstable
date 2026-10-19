@@ -1,0 +1,120 @@
+# Warm a default-branch ccache that PR "Build with GCC" jobs can restore.
+#
+# GitHub Actions scopes caches by branch: entries created on a PR merge ref
+# are invisible to other PRs. Entries created on master are visible to every
+# PR. This workflow rebuilds with the same GCC + Arch/OGC config recipe as
+# test-pr.yml and saves under the shared ccache-pr-gcc- prefix.
+#
+# Triggers on every push to master so both human PR merges and the daily
+# linux-next sync (force-push) refresh the cache against the current tree.
+
+name: Warm master GCC ccache
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-ccache-master
+  cancel-in-progress: true
+
+env:
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
+jobs:
+  warm:
+    name: Build with GCC (refresh master ccache)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: docker.io/archlinux:base-devel
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
+    steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Bootstrap build environment
+        run: |
+          set -euxo pipefail
+          pacman -Sy --needed --noconfirm archlinux-keyring
+          pacman -Su --needed --noconfirm
+          pacman -S --needed --noconfirm \
+            bc cpio gettext libelf pahole perl python tar xz zstd \
+            file curl git ccache
+
+      - name: Checkout master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: /ccache
+          # Unique key each run (cache keys are immutable). Prefix matches
+          # test-pr.yml restore-keys: ccache-pr-gcc-
+          key: ccache-pr-gcc-master-${{ github.sha }}
+          restore-keys: |
+            ccache-pr-gcc-master-
+            ccache-pr-gcc-
+
+      - name: Assemble test config (same as the PR GCC build)
+        run: |
+          set -euxo pipefail
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
+          PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
+          if [ -z "$PKG" ]; then
+            echo "::error::linux-headers package not found in cache"; exit 1
+          fi
+          CFG="$(tar --zstd -tf "$PKG" | grep -E '^usr/lib/modules/[^/]+/build/\.config$' || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel .config not found inside $PKG"; exit 1
+          fi
+          tar --zstd -xOf "$PKG" "$CFG" > .config
+          test -s .config
+          rm -rf "$CACHE"
+
+          for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash .github/packaging/merge-fragments.sh .config \
+              arch.config.set ogc.config.set \
+              arch.config.unset ogc.config.unset \
+              .github/packaging/config.fragment
+
+          scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+          scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+          scripts/config --set-str CONFIG_LOCALVERSION "" || true
+          scripts/config -d RUST
+          make olddefconfig
+
+      - name: Build kernel with GCC
+        run: |
+          set -euxo pipefail
+          ccache -s || true
+          make CC="ccache gcc" WERROR=0 -j"$(nproc)" all
+          echo "Kernel release: $(make -s kernelrelease)"
+          ccache -s
+          df -h /
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Master GCC ccache warm"
+            echo
+            echo "- Trigger: \`${{ github.event_name }}\` (actor: \`${{ github.actor }}\`)"
+            echo "- Cache key: \`ccache-pr-gcc-master-${{ github.sha }}\`"
+            echo "- Shared with PR builds via restore-keys prefix \`ccache-pr-gcc-\`"
+            echo "- Config: same as test-pr.yml GCC job (Arch headers + OGC fragments, Rust off)"
+          } >> "$GITHUB_STEP_SUMMARY"
