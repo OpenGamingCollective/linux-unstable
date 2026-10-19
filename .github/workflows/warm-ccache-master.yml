@@ -4,6 +4,8 @@
 # are invisible to other PRs. Entries created on master are visible to every
 # PR. This workflow is the sole writer of the shared GCC seed
 # (ccache-pr-gcc-master-*); test-pr.yml restores it but does not save.
+# After a successful save it deletes older ccache-pr-gcc-master-* entries
+# so the ~10GB Actions quota is not filled with stale seeds.
 #
 # Triggers on every push to master so both human PR merges and the daily
 # linux-next sync (force-push) refresh the cache against the current tree.
@@ -17,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: warm-ccache-master
@@ -117,4 +120,38 @@ jobs:
             echo "- Cache key: \`ccache-pr-gcc-master-${{ github.sha }}\`"
             echo "- Shared with PR builds via restore-keys prefix \`ccache-pr-gcc-\`"
             echo "- Config: same as test-pr.yml GCC job (Arch headers + OGC fragments, Rust off)"
+            echo "- Older \`ccache-pr-gcc-master-*\` seeds are pruned after this job succeeds"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # actions/cache saves in a post step after all job steps finish. A dependent
+  # job therefore runs only once the new seed is already uploaded.
+  prune-old-seeds:
+    name: Prune older master GCC ccache seeds
+    needs: warm
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete older ccache-pr-gcc-master-* entries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          KEEP_KEY: ccache-pr-gcc-master-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Keeping ${KEEP_KEY}"
+          mapfile -t IDS < <(
+            gh cache list --key ccache-pr-gcc-master- --limit 100 \
+              --json id,key --jq \
+              '.[] | select(.key != env.KEEP_KEY) | .id'
+          )
+          if [ "${#IDS[@]}" -eq 0 ]; then
+            echo "No older master GCC seeds to delete."
+            exit 0
+          fi
+          echo "Deleting ${#IDS[@]} older seed(s)..."
+          set +e
+          for id in "${IDS[@]}"; do
+            echo "  gh cache delete ${id}"
+            gh cache delete "${id}"
+          done
+          echo "Done."
