@@ -227,6 +227,11 @@
 #define USB_DEVICE_ID_ASUSTEK_ROG_KEYBOARD2 0x1837
 #define USB_DEVICE_ID_ASUSTEK_ROG_KEYBOARD3 0x1822
 #define USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD	0x1866
+/*
+ * 0x193b is shared by standalone Slash and AniMe Matrix. hid-asus
+ * discriminates by feature report 0x5e size, then DMI board name.
+ */
+#define USB_DEVICE_ID_ASUSTEK_ROG_SLASH	0x193b
 #define USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD2	0x19b6
 #define USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD3	0x1ce6
 #define USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD3_BT	0x1ce7
