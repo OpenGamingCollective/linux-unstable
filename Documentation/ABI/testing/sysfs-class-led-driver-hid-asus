@@ -15,3 +15,14 @@ Description:	ASUS Aura keyboard and chassis lightbar Dynamic Lighting nodes.
 		(Usage Page 0x59) when Aura 0xBC cannot address the lightbar
 		independently. The lightbar node is absent when the device
 		has no chassis lightbar.
+
+What:		/sys/class/leds/asus::slash/
+Date:		September 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	ASUS ROG Slash LED class device. Exposes brightness together with
+		``slash_mode``, ``slash_mode_index``, and ``slash_interval``
+		attributes. On Aura keyboards Slash uses feature report 0x5e.
+		USB ID 0x193b is shared with AniMe Matrix; the driver claims it
+		for Slash only when feature report 0x5e size and DMI board
+		discrimination select Slash rather than AniMe.

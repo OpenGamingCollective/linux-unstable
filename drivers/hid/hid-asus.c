@@ -66,6 +66,18 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define AURA_FEATURE_REPORT_SIZE	64
 #define ASUS_AURA_MAX_EFFECTS		13
 
+/*
+ * USB 0x193b is shared by Slash and AniMe Matrix. AniMe uses ~640-byte
+ * feature reports on 0x5e; Slash uses shorter Aura-sized reports.
+ */
+#define ASUS_ANIME_PACKET_SIZE		640
+
+enum asus_pid_193b_kind {
+	ASUS_PID_193B_NONE = 0,
+	ASUS_PID_193B_SLASH,
+	ASUS_PID_193B_ANIME,
+};
+
 #define AURA_CMD_PROBE			0x05
 #define AURA_CMD_RUN_MODE		0x9e
 #define AURA_CMD_SET_EFFECT		0xb3
@@ -309,6 +321,11 @@ struct asus_lamparray_lamp {
 
 struct asus_drvdata {
 	unsigned long quirks;
+	struct led_classdev slash_led;
+	bool has_slash_led;
+	u8 slash_mode;
+	u8 slash_brightness;
+	u8 slash_interval;
 	struct hid_device *hdev;
 	struct input_dev *input;
 	struct input_dev *tp_kbd_input;
@@ -1214,6 +1231,101 @@ static bool asus_is_lamparray_interface(struct hid_device *hdev)
 {
 	return asus_lamparray_detect_base(hdev) >= 0;
 }
+
+static size_t asus_feature_report_len(struct hid_device *hdev, u8 id)
+{
+	struct hid_report *report;
+
+	report = hdev->report_enum[HID_FEATURE_REPORT].report_id_hash[id];
+	if (!report)
+		return 0;
+	return hid_report_len(report);
+}
+
+static bool asus_dmi_is_anime_board(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	if (!board)
+		return false;
+
+	return strstr(board, "GA401I") || strstr(board, "GA401Q") ||
+	       strstr(board, "GA402R") || strstr(board, "GA402X") ||
+	       strstr(board, "GA402N") || strstr(board, "GU604V") ||
+	       strstr(board, "G635L") || strstr(board, "G835L");
+}
+
+/*
+ * Boards that ship a standalone Slash MCU on 0x193b and never AniMe.
+ * Keep this list conservative: unknown boards fall through to -ENODEV
+ * when report size alone cannot decide.
+ */
+static bool asus_dmi_is_slash_only_board(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	if (!board)
+		return false;
+
+	return strstr(board, "G614") || strstr(board, "G614J") ||
+	       strstr(board, "G614JZ") || strstr(board, "G614JI") ||
+	       strstr(board, "G614JV") || strstr(board, "G614PR");
+}
+
+
+/*
+ * USB 0x193b is shared by Slash and AniMe Matrix. Discriminate in order:
+ * 1) feature report 0x5e size (AniMe ~640 B, Slash Aura-sized)
+ * 2) known DMI boards when size is ambiguous
+ * 3) otherwise refuse to guess (-ENODEV / NONE)
+ */
+static enum asus_pid_193b_kind asus_classify_pid_193b(struct hid_device *hdev)
+{
+	size_t len_5e;
+	bool anime_dmi = asus_dmi_is_anime_board();
+	bool slash_dmi = asus_dmi_is_slash_only_board();
+
+	if (hdev->product != USB_DEVICE_ID_ASUSTEK_ROG_SLASH)
+		return ASUS_PID_193B_NONE;
+
+	len_5e = asus_feature_report_len(hdev, FEATURE_KBD_LED_REPORT_ID2);
+
+	if (len_5e >= ASUS_ANIME_PACKET_SIZE)
+		return ASUS_PID_193B_ANIME;
+
+	if (len_5e > 0 && len_5e < ASUS_ANIME_PACKET_SIZE) {
+		if (anime_dmi)
+			return ASUS_PID_193B_NONE;
+		return ASUS_PID_193B_SLASH;
+	}
+
+	/* No usable 0x5e length: Slash may talk on 0x5d only. */
+	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1)) {
+		if (anime_dmi)
+			return ASUS_PID_193B_NONE;
+		return ASUS_PID_193B_SLASH;
+	}
+
+	if (anime_dmi)
+		return ASUS_PID_193B_ANIME;
+	if (slash_dmi)
+		return ASUS_PID_193B_SLASH;
+
+	return ASUS_PID_193B_NONE;
+}
+
+/*
+ * Slash on Aura keyboards exposes report 0x5e. Standalone Slash MCU reuses
+ * USB 0x193b and is accepted only when classify_pid_193b says SLASH.
+ */
+static bool asus_device_has_slash(struct hid_device *hdev)
+{
+	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH)
+		return asus_classify_pid_193b(hdev) == ASUS_PID_193B_SLASH;
+
+	return asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2);
+}
+
 static int asus_kbd_register_leds(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -2092,16 +2204,21 @@ static int asus_lamparray_apply_unlocked(struct asus_drvdata *drvdata,
 	size_t multi_len;
 	int ret;
 
-	ret = asus_lamparray_take_control_unlocked(drvdata);
-	if (ret < 0)
-		return ret;
-
 	for (i = 0; i < drvdata->lamparray_count; i++) {
 		if (drvdata->lamparray_lamps[i].keyboard == keyboard)
 			match[nmatch++] = i;
 	}
+	/*
+	 * No lamps for this zone: let callers fall back to Aura 0xBC.
+	 * Check before take_control so an empty match does not claim the
+	 * LampArray sibling and then report success.
+	 */
 	if (!nmatch)
-		return 0;
+		return -ENODEV;
+
+	ret = asus_lamparray_take_control_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
 
 	src = keyboard ? drvdata->kbd_direct_buf : drvdata->lb_direct_buf;
 	src_leds = keyboard ? ROG_STRIX_4ZONE_KBD_LEDS :
@@ -2377,6 +2494,7 @@ static int asus_aura_lightbar_write_packet(struct asus_drvdata *drvdata,
 
 	if (buffer != drvdata->lb_direct_buf)
 		memcpy(drvdata->lb_direct_buf, buffer, payload_len);
+	drvdata->lb_direct_valid = true;
 	memcpy(&buf[ROG_STRIX_PERKEY_DIRECT_PAYLOAD_OFFSET],
 	       drvdata->lb_direct_buf, payload_len);
 
@@ -2810,6 +2928,257 @@ static int asus_aura_discover(struct asus_drvdata *drvdata, bool *has_lightbar,
 	return 0;
 }
 
+static const struct asus_slash_mode {
+	const char *name;
+	u8 mode;
+} asus_slash_modes[] = {
+	{ "Static", 0x06 },
+	{ "Bounce", 0x10 },
+	{ "Slash", 0x12 },
+	{ "Loading", 0x13 },
+	{ "BitStream", 0x1d },
+	{ "Transmission", 0x1a },
+	{ "Flow", 0x19 },
+	{ "Flux", 0x25 },
+	{ "Phantom", 0x24 },
+	{ "Spectrum", 0x26 },
+	{ "Hazard", 0x32 },
+	{ "Interfacing", 0x33 },
+	{ "Ramp", 0x34 },
+	{ "GameOver", 0x42 },
+	{ "Start", 0x43 },
+	{ "Buzzer", 0x44 },
+};
+
+static inline u8 asus_slash_report_id(struct asus_drvdata *drvdata)
+{
+	if (asus_has_report_id(drvdata->hdev, FEATURE_KBD_LED_REPORT_ID2))
+		return FEATURE_KBD_LED_REPORT_ID2;
+	return FEATURE_KBD_LED_REPORT_ID1;
+}
+
+static int asus_slash_init_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd7, 0x00, 0x00, 0x01, 0xac };
+	u8 pkt2[] = { rpt, 0xd2, 0x02, 0x01, 0x08, 0xab };
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_set_options_unlocked(struct asus_drvdata *drvdata, bool enabled,
+					   u8 brightness, u8 interval)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = {
+		rpt, 0xd3, 0x03, 0x01, 0x08, 0xab, 0xff, 0x01,
+		enabled ? 1 : 0, 0x06, brightness, 0xff, interval
+	};
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_set_mode_unlocked(struct asus_drvdata *drvdata, u8 mode)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt1[] = { rpt, 0xd2, 0x03, 0x00, 0x0c };
+	u8 pkt2[] = {
+		rpt, 0xd3, 0x04, 0x00, 0x0c, 0x01, mode, 0x02,
+		0x19, 0x03, 0x13, 0x04, 0x11, 0x05, 0x12, 0x06, 0x13
+	};
+	int ret;
+
+	ret = asus_aura_set_feature_unlocked(drvdata, pkt1, sizeof(pkt1));
+	if (ret < 0)
+		return ret;
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt2, sizeof(pkt2));
+}
+
+static int asus_slash_save_unlocked(struct asus_drvdata *drvdata)
+{
+	u8 rpt = asus_slash_report_id(drvdata);
+	u8 pkt[] = { rpt, 0xd4, 0x00, 0x00, 0x01, 0xab };
+
+	return asus_aura_set_feature_unlocked(drvdata, pkt, sizeof(pkt));
+}
+
+static int asus_slash_brightness_set_blocking(struct led_classdev *led_cdev,
+					      enum led_brightness brightness)
+{
+	struct asus_drvdata *drvdata = container_of(led_cdev, struct asus_drvdata, slash_led);
+	int ret;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_brightness = brightness;
+	ret = asus_slash_set_options_unlocked(drvdata, brightness > 0, (u8)brightness,
+					      drvdata->slash_interval);
+	if (ret < 0)
+		return ret;
+
+	return asus_slash_save_unlocked(drvdata);
+}
+
+static ssize_t slash_mode_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (asus_slash_modes[i].mode == drvdata->slash_mode)
+			return sysfs_emit(buf, "%s\n", asus_slash_modes[i].name);
+	}
+
+	return sysfs_emit(buf, "0x%02x\n", drvdata->slash_mode);
+}
+
+static ssize_t slash_mode_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	char mode_str[32];
+	unsigned int i;
+	u8 mode_val = 0;
+	int ret;
+
+	if (sscanf(buf, "%31s", mode_str) != 1)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(asus_slash_modes); i++) {
+		if (sysfs_streq(mode_str, asus_slash_modes[i].name)) {
+			mode_val = asus_slash_modes[i].mode;
+			break;
+		}
+	}
+
+	if (!mode_val) {
+		if (kstrtou8(mode_str, 0, &mode_val))
+			return -EINVAL;
+	}
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	ret = asus_slash_set_mode_unlocked(drvdata, mode_val);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	drvdata->slash_mode = mode_val;
+	return count;
+}
+static DEVICE_ATTR_RW(slash_mode);
+
+static ssize_t slash_mode_index_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf,
+			  "Static Bounce Slash Loading BitStream Transmission Flow Flux Phantom Spectrum Hazard Interfacing Ramp GameOver Start Buzzer\n");
+}
+static DEVICE_ATTR_RO(slash_mode_index);
+
+static ssize_t slash_interval_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+
+	return sysfs_emit(buf, "%u\n", drvdata->slash_interval);
+}
+
+static ssize_t slash_interval_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct led_classdev *led = dev_get_drvdata(dev);
+	struct asus_drvdata *drvdata = container_of(led, struct asus_drvdata, slash_led);
+	u8 interval;
+	int ret;
+
+	if (kstrtou8(buf, 0, &interval))
+		return -EINVAL;
+
+	guard(mutex)(&drvdata->aura_lock);
+
+	drvdata->slash_interval = interval;
+	ret = asus_slash_set_options_unlocked(drvdata, drvdata->slash_brightness > 0,
+					      drvdata->slash_brightness, interval);
+	if (ret < 0)
+		return ret;
+
+	ret = asus_slash_save_unlocked(drvdata);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(slash_interval);
+
+static struct attribute *asus_slash_attrs[] = {
+	&dev_attr_slash_mode.attr,
+	&dev_attr_slash_mode_index.attr,
+	&dev_attr_slash_interval.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_slash_group = {
+	.attrs = asus_slash_attrs,
+};
+
+static const struct attribute_group *asus_slash_groups[] = {
+	&asus_slash_group,
+	NULL,
+};
+
+static int asus_init_slash(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	int ret;
+
+	if (!asus_device_has_slash(hdev))
+		return 0;
+
+	drvdata->slash_led.name = "asus::slash";
+	drvdata->slash_led.max_brightness = 255;
+	drvdata->slash_led.brightness = 255;
+	drvdata->slash_led.brightness_set_blocking = asus_slash_brightness_set_blocking;
+	drvdata->slash_led.groups = asus_slash_groups;
+
+	drvdata->slash_brightness = 255;
+	drvdata->slash_interval = 0;
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_slash_init_unlocked(drvdata);
+		if (ret < 0) {
+			hid_warn(hdev, "Failed to initialize Slash lighting: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = devm_led_classdev_register(&hdev->dev, &drvdata->slash_led);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to register Slash LED classdev: %d\n", ret);
+		return ret;
+	}
+
+	drvdata->has_slash_led = true;
+	hid_info(hdev, "Registered Slash lighting LED: asus::slash\n");
+
+	return 0;
+}
+
 static void asus_aura_dldev_set_default_palette(struct led_classdev_dynamic *ldev,
 						struct dl_rgb *palette)
 {
@@ -3079,6 +3448,12 @@ static inline int asus_init_dynamic_lighting(struct hid_device *hdev)
 {
 	return 0;
 }
+
+static inline int asus_init_slash(struct hid_device *hdev)
+{
+	return 0;
+}
+
 
 static inline void asus_aura_capture_boot_effect(struct hid_device *hdev)
 {
@@ -3691,6 +4066,21 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 	}
 
+	/*
+	 * USB 0x193b is shared by Slash and AniMe Matrix. LampArray siblings
+	 * bind as usual. Claim Slash only; refuse AniMe and ambiguous
+	 * interfaces (AniMe support is a separate change).
+	 */
+	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH &&
+	    !asus_is_lamparray_interface(hdev)) {
+		enum asus_pid_193b_kind kind = asus_classify_pid_193b(hdev);
+
+		if (kind != ASUS_PID_193B_SLASH) {
+			hid_dbg(hdev,
+				"Skipping 0x193b (not Slash; kind=%d)\n", kind);
+			return -ENODEV;
+		}
+	}
 
 	/* Check for vendor for RGB init and handle generic devices properly. */
 	rep_enum = &hdev->report_enum[HID_INPUT_REPORT];
@@ -3760,14 +4150,22 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	/* Laptops keyboard backlight is always at 0x5a */
 	if (is_vendor && (drvdata->quirks & QUIRK_USE_KBD_BACKLIGHT) &&
 	    (asus_has_report_id(hdev, FEATURE_KBD_REPORT_ID)) &&
-		(asus_kbd_register_leds(hdev)))
+	    (asus_kbd_register_leds(hdev)))
 		hid_warn(hdev, "Failed to initialize backlight.\n");
 
 	if (asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID1) ||
 	    asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2)) {
 		ret = asus_init_dynamic_lighting(hdev);
 		if (ret < 0)
-			hid_warn(hdev, "Failed to initialize dynamic lighting: %d\n", ret);
+			hid_warn(hdev,
+				 "Failed to initialize dynamic lighting: %d\n",
+				 ret);
+
+		ret = asus_init_slash(hdev);
+		if (ret < 0)
+			hid_warn(hdev,
+				 "Failed to initialize Slash lighting: %d\n",
+				 ret);
 	}
 
 	/*
@@ -3975,6 +4373,9 @@ static const struct hid_device_id asus_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
+	    USB_DEVICE_ID_ASUSTEK_ROG_SLASH),
+	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
 	    USB_DEVICE_ID_ASUSTEK_ROG_NKEY_KEYBOARD2),
 	  QUIRK_USE_KBD_BACKLIGHT | QUIRK_ROG_NKEY_KEYBOARD | QUIRK_HID_FN_LOCK },
