@@ -1,0 +1,51 @@
+# Drop Actions caches scoped to a PR merge ref when the PR closes.
+# Those entries cannot seed other PRs or master, but they still count
+# against the repository 10GB cache quota.
+
+name: Cleanup PR Actions caches
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number whose refs/pull/N/merge caches to delete (empty = skip)"
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete PR-scoped caches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete caches for the PR merge ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "No PR number; nothing to delete."
+            exit 0
+          fi
+          BRANCH="refs/pull/${PR_NUMBER}/merge"
+          echo "Listing caches for ${BRANCH}..."
+          # gh cache list --ref filters by the ref that created the cache.
+          mapfile -t IDS < <(gh cache list --ref "${BRANCH}" --limit 100 --json id --jq '.[].id')
+          if [ "${#IDS[@]}" -eq 0 ]; then
+            echo "No caches found for ${BRANCH}."
+            exit 0
+          fi
+          echo "Deleting ${#IDS[@]} cache(s)..."
+          set +e
+          for id in "${IDS[@]}"; do
+            echo "  gh cache delete ${id}"
+            gh cache delete "${id}"
+          done
+          echo "Done."

@@ -121,12 +121,16 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Restore-only: warm-ccache-master.yml is the sole writer of the shared
+      # GCC seed on master. Saving per-PR caches fills the 10GB Actions quota
+      # and those entries are invisible to other PRs anyway.
       - name: Restore compiler cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: /ccache
-          key: ccache-pr-gcc-${{ github.sha }}
+          key: ccache-pr-gcc-master-${{ github.sha }}
           restore-keys: |
+            ccache-pr-gcc-master-
             ccache-pr-gcc-
 
       - name: Assemble test config (same as the Arch release build)

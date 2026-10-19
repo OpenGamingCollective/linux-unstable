@@ -2,8 +2,8 @@
 #
 # GitHub Actions scopes caches by branch: entries created on a PR merge ref
 # are invisible to other PRs. Entries created on master are visible to every
-# PR. This workflow rebuilds with the same GCC + Arch/OGC config recipe as
-# test-pr.yml and saves under the shared ccache-pr-gcc- prefix.
+# PR. This workflow is the sole writer of the shared GCC seed
+# (ccache-pr-gcc-master-*); test-pr.yml restores it but does not save.
 #
 # Triggers on every push to master so both human PR merges and the daily
 # linux-next sync (force-push) refresh the cache against the current tree.
