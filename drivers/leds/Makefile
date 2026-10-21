@@ -5,6 +5,20 @@ obj-$(CONFIG_NEW_LEDS)			+= led-core.o
 obj-$(CONFIG_LEDS_CLASS)		+= led-class.o
 obj-$(CONFIG_LEDS_CLASS_FLASH)		+= led-class-flash.o
 obj-$(CONFIG_LEDS_CLASS_MULTICOLOR)	+= led-class-multicolor.o
+obj-$(CONFIG_LEDS_CLASS_DYNAMIC)	+= led-class-dynamic.o
+# Follow LEDS_KUNIT_TEST. Skip the built-in test when the class is modular,
+# so vmlinux does not reference a module.
+ifeq ($(CONFIG_LEDS_CLASS_DYNAMIC),y)
+ifeq ($(CONFIG_LEDS_KUNIT_TEST),y)
+obj-y				+= led-class-dynamic-test.o
+endif
+ifeq ($(CONFIG_LEDS_KUNIT_TEST),m)
+obj-m				+= led-class-dynamic-test.o
+endif
+endif
+ifeq ($(CONFIG_LEDS_CLASS_DYNAMIC)$(CONFIG_LEDS_KUNIT_TEST),mm)
+obj-m				+= led-class-dynamic-test.o
+endif
 obj-$(CONFIG_LEDS_TRIGGERS)		+= led-triggers.o
 obj-$(CONFIG_LEDS_KUNIT_TEST)		+= led-test.o
 
