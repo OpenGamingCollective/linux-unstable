@@ -12,15 +12,47 @@ concurrency:
   group: sync-linux-next
   cancel-in-progress: false
 
+env:
+  KERNEL_PACKAGES_RAW: https://raw.githubusercontent.com/OpenGamingCollective/kernel-packages/main
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Same Arch userspace as test-pr.yml / warm-ccache-master.yml so the
+    # pre-push compile gate matches what PR builds will see on master.
+    container:
+      image: docker.io/archlinux:base-devel
+    timeout-minutes: 360
+    env:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 10G
     steps:
+      - name: Show disk space
+        run: df -h /
+
+      - name: Bootstrap build environment
+        run: |
+          set -euxo pipefail
+          pacman -Sy --needed --noconfirm archlinux-keyring
+          pacman -Su --needed --noconfirm
+          pacman -S --needed --noconfirm \
+            bc cpio gettext libelf pahole perl python tar xz zstd \
+            file curl git ccache
+
       - name: Checkout fork
         uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v6
+        with:
+          path: /ccache
+          key: ccache-pr-gcc-master-${{ github.sha }}
+          restore-keys: |
+            ccache-pr-gcc-master-
+            ccache-pr-gcc-
 
       - name: Configure upstream
         run: |
@@ -29,6 +61,7 @@ jobs:
           git fetch --no-tags upstream --prune
 
       - name: Replay fork commits on top of upstream/master
+        id: replay
         run: |
           set -euo pipefail
 
@@ -64,6 +97,7 @@ jobs:
           # hashes for identical content.
           if [ "$(git rev-parse "$BASE")" = "$(git rev-parse "$UP_BASE")" ]; then
             echo "master is already based on the current linux-next tip; nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -114,5 +148,56 @@ jobs:
             fi
           done
 
-          echo "Done. Pushing updated master."
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Replay finished; compile gate runs next before any push."
+
+      - name: Assemble test config (same as the PR GCC build)
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          set -euxo pipefail
+          CACHE="/tmp/pkgcache"
+          mkdir -p "$CACHE"
+          pacman -Sw --noconfirm --cachedir "$CACHE" linux-headers
+          PKG="$(find "$CACHE" -maxdepth 1 -name 'linux-headers-*.pkg.tar.zst' -type f)"
+          if [ -z "$PKG" ]; then
+            echo "::error::linux-headers package not found in cache"; exit 1
+          fi
+          CFG="$(tar --zstd -tf "$PKG" | grep -E '^usr/lib/modules/[^/]+/build/\.config$' || true)"
+          if [ -z "$CFG" ]; then
+            echo "::error::kernel .config not found inside $PKG"; exit 1
+          fi
+          tar --zstd -xOf "$PKG" "$CFG" > .config
+          test -s .config
+          rm -rf "$CACHE"
+
+          for f in arch.config.set ogc.config.set arch.config.unset ogc.config.unset; do
+            curl -fsSL "${KERNEL_PACKAGES_RAW}/config/${f}" -o "${f}"
+          done
+          bash .github/packaging/merge-fragments.sh .config \
+              arch.config.set ogc.config.set \
+              arch.config.unset ogc.config.unset \
+              .github/packaging/config.fragment
+
+          scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+          scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+          scripts/config --set-str CONFIG_LOCALVERSION "" || true
+          scripts/config -d RUST
+          make olddefconfig
+
+      - name: "Gate: GCC build before updating master"
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          set -euxo pipefail
+          ccache -s || true
+          make CC="ccache gcc" WERROR=0 -j"$(nproc)" all
+          echo "Kernel release: $(make -s kernelrelease)"
+          ccache -s
+          df -h /
+
+      - name: Push updated master
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          echo "Compile gate passed. Pushing updated master."
           git push --force-with-lease origin master
