@@ -22,6 +22,7 @@
 
 #include <linux/acpi.h>
 #include <linux/cleanup.h>
+#include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/hid.h>
 #include <linux/module.h>
@@ -64,7 +65,8 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define ROG_ALLY_MIN_MCU 319
 
 #define AURA_FEATURE_REPORT_SIZE	64
-#define ASUS_AURA_MAX_EFFECTS		13
+#define ASUS_AURA_MAX_EFFECTS		14
+#define ROG_ALLY_MAX_KBD_LEDS		8
 
 /*
  * AniMe Matrix (USB 0x193b, feature report 0x5e). Packet layout and DMI
@@ -168,6 +170,18 @@ enum asus_pid_193b_kind {
 #define AURA_EFFECT_PULSE			0x0a
 #define AURA_EFFECT_COMET			0x0b
 #define AURA_EFFECT_FLASH			0x0c
+/* Ally / Xbox Ally MCU reactive mode (not notebook highlight 0x06). */
+#define AURA_EFFECT_ALLY_REACTIVE	0x0e
+
+/* Ally LED power (feature 5a d1 09) and Xbox Guide LED (OUT 5d d1 20/21). */
+#define ALLY_CMD_SET_LED_POWER		0x09
+#define ALLY_CMD_CHECK_XBOX_LED		0x1b
+#define ALLY_CMD_SET_XBOX_LED_BRIGHTNESS 0x20
+#define ALLY_CMD_SET_XBOX_LED_EFFECT	0x21
+#define ALLY_LED_POWER_BOOT		BIT(0)
+#define ALLY_LED_POWER_AWAKE		BIT(1)
+#define ALLY_LED_POWER_SLEEP		BIT(2)
+#define ALLY_LED_POWER_SHUTDOWN		BIT(3)
 
 #define AURA_SPEED_SLOW			0xe1
 #define AURA_SPEED_MED			0xeb
@@ -332,6 +346,8 @@ struct asus_lamparray_lamp {
 	s32 x;
 	bool keyboard;
 };
+
+struct asus_xbox_led;
 #endif
 
 struct asus_drvdata {
@@ -392,10 +408,11 @@ struct asus_drvdata {
 	u8 boot_direction;
 	bool is_strix_4zone;
 	bool has_lightbar;
-	u8 kbd_direct_buf[ROG_STRIX_4ZONE_KBD_BUF_SIZE];
+	u8 kbd_direct_buf[ROG_ALLY_MAX_KBD_LEDS * 3];
 	u8 lb_direct_buf[ROG_STRIX_LIGHTBAR_BUF_SIZE];
 	bool kbd_direct_valid;
 	bool lb_direct_valid;
+	struct asus_xbox_led *xbox_led;
 	struct hid_device *lamparray_hdev;
 	u8 *lamparray_buf;
 	size_t lamparray_buf_len;
@@ -1366,10 +1383,24 @@ static enum asus_pid_193b_kind asus_classify_pid_193b(struct hid_device *hdev)
  */
 static bool asus_device_has_slash(struct hid_device *hdev)
 {
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+
+	/*
+	 * Ally / Xbox Ally expose report 0x5e on the vendor interface but have
+	 * no Slash bar. Do not register asus::slash on those devices.
+	 */
+	if (drvdata && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD))
+		return false;
+
 	if (hdev->product == USB_DEVICE_ID_ASUSTEK_ROG_SLASH)
 		return asus_classify_pid_193b(hdev) == ASUS_PID_193B_SLASH;
 
 	return asus_has_report_id(hdev, FEATURE_KBD_LED_REPORT_ID2);
+}
+
+static bool asus_is_ally(struct asus_drvdata *drvdata)
+{
+	return !!(drvdata->quirks & QUIRK_ROG_ALLY_XPAD);
 }
 
 static int asus_kbd_register_leds(struct hid_device *hdev)
@@ -1645,6 +1676,32 @@ static const struct {
 	{ "flash",		AURA_EFFECT_FLASH,		BIT(12) },
 };
 
+/*
+ * Ally MCUs reject the 0x9e capability query. Advertising the notebook
+ * fallback list freezes the rings on unsupported modes; ship the modes the
+ * handheld firmware actually runs, plus Ally reactive (0x0e).
+ */
+static unsigned int asus_aura_fill_ally_effects(const char **dst,
+						bool direct_capable)
+{
+	static const char * const ally_effects[] = {
+		"static",
+		"breathe",
+		"rainbow_cycle",
+		"rainbow_wave",
+		"pulse",
+		"reactive",
+	};
+	unsigned int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(ally_effects); i++)
+		dst[n++] = ally_effects[i];
+	if (direct_capable)
+		dst[n++] = "direct";
+
+	return n;
+}
+
 static unsigned int asus_aura_fill_effects(const char **dst,
 					   const u8 *effect_mask,
 					   bool direct_capable)
@@ -1670,6 +1727,11 @@ static int asus_aura_hw_mode_from_name(const char *name, u8 *aura_mode)
 	if (!name)
 		return -EINVAL;
 
+	if (!strcmp(name, "reactive")) {
+		*aura_mode = AURA_EFFECT_ALLY_REACTIVE;
+		return 0;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
 		if (!strcmp(name, asus_aura_effect_map[i].name)) {
 			*aura_mode = asus_aura_effect_map[i].hw_mode;
@@ -1683,6 +1745,9 @@ static int asus_aura_hw_mode_from_name(const char *name, u8 *aura_mode)
 static bool asus_aura_hw_mode_known(u8 mode)
 {
 	unsigned int i;
+
+	if (mode == AURA_EFFECT_ALLY_REACTIVE)
+		return true;
 
 	for (i = 0; i < ARRAY_SIZE(asus_aura_effect_map); i++) {
 		if (asus_aura_effect_map[i].hw_mode == mode)
@@ -2242,12 +2307,13 @@ static int asus_lamparray_apply_unlocked(struct asus_drvdata *drvdata,
 					 bool keyboard)
 {
 	unsigned int match[ASUS_LAMPARRAY_MAX_LAMPS];
-	unsigned int nmatch = 0, idx = 0, i;
+	unsigned int nmatch = 0, idx = 0, i, pass;
 	unsigned int src_leds;
 	const u8 *src;
 	u8 *buf = drvdata->lamparray_buf;
 	u8 rid_multi = asus_lamparray_rid(drvdata, ASUS_LAMPARRAY_RID_MULTI);
 	size_t multi_len;
+	bool took_control;
 	int ret;
 
 	for (i = 0; i < drvdata->lamparray_count; i++) {
@@ -2262,46 +2328,61 @@ static int asus_lamparray_apply_unlocked(struct asus_drvdata *drvdata,
 	if (!nmatch)
 		return -ENODEV;
 
+	took_control = !drvdata->lamparray_controlled;
 	ret = asus_lamparray_take_control_unlocked(drvdata);
 	if (ret < 0)
 		return ret;
 
 	src = keyboard ? drvdata->kbd_direct_buf : drvdata->lb_direct_buf;
-	src_leds = keyboard ? ROG_STRIX_4ZONE_KBD_LEDS :
-			      asus_aura_lb_led_count(drvdata);
+	if (keyboard) {
+		src_leds = drvdata->dldev_kbd.led_count;
+		if (!src_leds || src_leds > ROG_ALLY_MAX_KBD_LEDS)
+			src_leds = ROG_STRIX_4ZONE_KBD_LEDS;
+	} else {
+		src_leds = asus_aura_lb_led_count(drvdata);
+	}
 
 	multi_len = asus_lamparray_report_len(drvdata->lamparray_hdev, rid_multi);
 	if (multi_len < 51)
 		return -EPROTO;
 
-	for (i = 0; i < nmatch; i += ASUS_LAMPARRAY_MULTI_MAX) {
-		unsigned int n = min_t(unsigned int, ASUS_LAMPARRAY_MULTI_MAX,
-				       nmatch - i);
-		unsigned int j;
-		unsigned int id_off = 3;
-		unsigned int col_off = 3 + ASUS_LAMPARRAY_MULTI_MAX * 2;
+	/*
+	 * Ally MCUs often drop the first MultiUpdate sent immediately after
+	 * take_control. Push the frame twice when we just claimed the device.
+	 */
+	for (pass = 0; pass < (took_control ? 2 : 1); pass++) {
+		idx = 0;
+		for (i = 0; i < nmatch; i += ASUS_LAMPARRAY_MULTI_MAX) {
+			unsigned int n = min_t(unsigned int,
+					       ASUS_LAMPARRAY_MULTI_MAX,
+					       nmatch - i);
+			unsigned int j;
+			unsigned int id_off = 3;
+			unsigned int col_off = 3 + ASUS_LAMPARRAY_MULTI_MAX * 2;
 
-		asus_lamparray_prepare(drvdata, rid_multi);
-		buf[1] = n;
-		buf[2] = (i + n >= nmatch) ? ASUS_LAMPARRAY_FLAG_COMPLETE : 0;
+			asus_lamparray_prepare(drvdata, rid_multi);
+			buf[1] = n;
+			buf[2] = (i + n >= nmatch) ?
+				 ASUS_LAMPARRAY_FLAG_COMPLETE : 0;
 
-		for (j = 0; j < n; j++) {
-			unsigned int lamp = match[i + j];
-			u8 r, g, b;
-			u16 id = drvdata->lamparray_lamps[lamp].id;
+			for (j = 0; j < n; j++) {
+				unsigned int lamp = match[i + j];
+				u8 r, g, b;
+				u16 id = drvdata->lamparray_lamps[lamp].id;
 
-			asus_lamparray_sample_rgb(src, src_leds, idx++, nmatch,
-						  &r, &g, &b);
-			put_unaligned_le16(id, buf + id_off + j * 2);
-			buf[col_off + j * 4 + 0] = r;
-			buf[col_off + j * 4 + 1] = g;
-			buf[col_off + j * 4 + 2] = b;
-			buf[col_off + j * 4 + 3] = 0xff;
+				asus_lamparray_sample_rgb(src, src_leds, idx++,
+							  nmatch, &r, &g, &b);
+				put_unaligned_le16(id, buf + id_off + j * 2);
+				buf[col_off + j * 4 + 0] = r;
+				buf[col_off + j * 4 + 1] = g;
+				buf[col_off + j * 4 + 2] = b;
+				buf[col_off + j * 4 + 3] = 0xff;
+			}
+
+			ret = asus_lamparray_raw(drvdata, buf, multi_len, false);
+			if (ret < 0)
+				return ret;
 		}
-
-		ret = asus_lamparray_raw(drvdata, buf, multi_len, false);
-		if (ret < 0)
-			return ret;
 	}
 
 	return 0;
@@ -2397,8 +2478,12 @@ static int asus_aura_strix_write_direct(struct asus_drvdata *drvdata,
 	guard(mutex)(&drvdata->aura_lock);
 
 	if (drvdata->is_strix_4zone) {
-		unsigned int leds = min_t(size_t, size / 3,
-					  ROG_STRIX_4ZONE_KBD_LEDS);
+		unsigned int max_leds = drvdata->dldev_kbd.led_count;
+		unsigned int leds;
+
+		if (!max_leds || max_leds > ROG_ALLY_MAX_KBD_LEDS)
+			max_leds = ROG_STRIX_4ZONE_KBD_LEDS;
+		leds = min_t(size_t, size / 3, max_leds);
 
 		if (buffer != drvdata->kbd_direct_buf)
 			memcpy(drvdata->kbd_direct_buf, buffer, leds * 3);
@@ -2634,6 +2719,18 @@ static int asus_aura_commit_effect(struct led_classdev_dynamic *ldev,
 						 asus_aura_speed_to_hw(speed),
 						 asus_aura_direction_to_hw(direction),
 						 r2, g2, b2);
+	else if (asus_is_ally(drvdata))
+		/*
+		 * Ally X and Xbox Ally X share PID 0x1b4c. Discovery still
+		 * reports 4-zone (byte 9 = 0x02), but zones 1-4 are only the
+		 * left ring on Xbox Ally X. Zone 0 addresses both rings on
+		 * both MCUs (Armoury Crate and the out-of-tree Ally driver).
+		 */
+		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL,
+						  aura_mode, r, g, b,
+						  asus_aura_speed_to_hw(speed),
+						  asus_aura_direction_to_hw(direction),
+						  r2, g2, b2, true);
 	else if (drvdata->is_strix_4zone)
 		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_KEY1,
 						 AURA_ZONE_KEY4, aura_mode,
@@ -2813,6 +2910,192 @@ static int asus_aura_set_palette(struct led_classdev_dynamic *ldev,
 				       palette, num_entries);
 }
 
+static bool asus_dmi_is_xbox_ally(void)
+{
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+
+	return board && strstr(board, "RC74XA");
+}
+
+static int asus_ally_write_led_power(struct asus_drvdata *drvdata, u8 flags)
+{
+	u8 buf[FEATURE_KBD_REPORT_SIZE] = {
+		FEATURE_KBD_REPORT_ID, 0xd1, ALLY_CMD_SET_LED_POWER, 0x01, flags
+	};
+
+	return asus_kbd_set_report(drvdata->hdev, buf, sizeof(buf));
+}
+
+static u8 asus_ally_power_flags(u32 states)
+{
+	u8 flags = 0;
+
+	if (states & DL_POWER_STATE_BOOT)
+		flags |= ALLY_LED_POWER_BOOT;
+	if (states & DL_POWER_STATE_AWAKE)
+		flags |= ALLY_LED_POWER_AWAKE;
+	if (states & DL_POWER_STATE_SLEEP)
+		flags |= ALLY_LED_POWER_SLEEP;
+	if (states & DL_POWER_STATE_SHUTDOWN)
+		flags |= ALLY_LED_POWER_SHUTDOWN;
+
+	return flags;
+}
+
+/*
+ * ROG Xbox Ally X (RC74XA) Guide button LED. Separate from the stick rings:
+ * brightness is interrupt OUT 5d d1 20, effect is feature 5a d1 21. Ring
+ * brightness 0 also turns this LED off; callers re-apply after leaving 0.
+ */
+struct asus_xbox_led {
+	struct hid_device *hdev;
+	struct led_classdev cdev;
+	struct mutex lock;
+	u8 brightness;
+	u8 effect;
+	u8 speed;
+};
+
+static int asus_xbox_led_set_effect(struct asus_xbox_led *led)
+{
+	u8 buf[FEATURE_KBD_REPORT_SIZE] = {
+		FEATURE_KBD_REPORT_ID, 0xd1, ALLY_CMD_SET_XBOX_LED_EFFECT, 0x02,
+		led->effect, led->speed,
+	};
+	int ret;
+
+	guard(mutex)(&led->lock);
+
+	ret = asus_kbd_set_report(led->hdev, buf, sizeof(buf));
+	if (ret < 0)
+		hid_warn(led->hdev, "Xbox LED effect failed: %d\n", ret);
+
+	return ret;
+}
+
+static int asus_xbox_led_set_brightness(struct asus_xbox_led *led)
+{
+	u8 buf[FEATURE_KBD_REPORT_SIZE] = {
+		FEATURE_KBD_LED_REPORT_ID1, 0xd1, ALLY_CMD_SET_XBOX_LED_BRIGHTNESS,
+		0x01, led->brightness,
+	};
+	int ret;
+
+	guard(mutex)(&led->lock);
+
+	ret = asus_kbd_set_report(led->hdev, buf, sizeof(buf));
+	if (ret < 0)
+		hid_warn(led->hdev, "Xbox LED brightness failed: %d\n", ret);
+
+	return ret;
+}
+
+static int asus_xbox_led_apply(struct asus_xbox_led *led)
+{
+	int ret;
+
+	if (!led)
+		return 0;
+
+	ret = asus_xbox_led_set_effect(led);
+	if (ret < 0)
+		return ret;
+
+	return asus_xbox_led_set_brightness(led);
+}
+
+static int asus_xbox_led_set_blocking(struct led_classdev *cdev,
+				      enum led_brightness brightness)
+{
+	struct asus_xbox_led *led = container_of(cdev, struct asus_xbox_led, cdev);
+
+	if (brightness > 3)
+		brightness = 3;
+
+	led->brightness = brightness;
+	cdev->brightness = brightness;
+	return asus_xbox_led_set_brightness(led);
+}
+
+static bool asus_check_xbox_led_support(struct hid_device *hdev)
+{
+	u8 *set_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
+	u8 *get_buf __free(kfree) = kzalloc(ROG_ALLY_REPORT_SIZE, GFP_KERNEL);
+	int ret;
+
+	if (!set_buf || !get_buf)
+		return false;
+
+	set_buf[0] = FEATURE_KBD_REPORT_ID;
+	set_buf[1] = 0xd1;
+	set_buf[2] = ALLY_CMD_CHECK_XBOX_LED;
+	set_buf[3] = 0x03;
+
+	ret = hid_hw_raw_request(hdev, FEATURE_KBD_REPORT_ID, set_buf,
+				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
+				 HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return false;
+
+	usleep_range(5000, 10000);
+
+	get_buf[0] = FEATURE_KBD_REPORT_ID;
+	ret = hid_hw_raw_request(hdev, FEATURE_KBD_REPORT_ID, get_buf,
+				 ROG_ALLY_REPORT_SIZE, HID_FEATURE_REPORT,
+				 HID_REQ_GET_REPORT);
+	if (ret < 0)
+		return false;
+
+	return get_buf[1] == 0xd1 &&
+	       get_buf[2] == ALLY_CMD_CHECK_XBOX_LED &&
+	       (get_buf[5] & 0x08);
+}
+
+static int asus_init_xbox_led(struct hid_device *hdev)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct asus_xbox_led *led;
+	int ret;
+
+	if (!asus_is_ally(drvdata))
+		return 0;
+
+	if (!asus_check_xbox_led_support(hdev) && !asus_dmi_is_xbox_ally())
+		return 0;
+
+	led = devm_kzalloc(&hdev->dev, sizeof(*led), GFP_KERNEL);
+	if (!led)
+		return -ENOMEM;
+
+	led->hdev = hdev;
+	mutex_init(&led->lock);
+	led->brightness = 3;
+	led->effect = AURA_EFFECT_STATIC;
+	led->speed = 0x08;
+
+	led->cdev.name = "asus::xbox_logo";
+	led->cdev.max_brightness = 3;
+	led->cdev.brightness = led->brightness;
+	led->cdev.brightness_set_blocking = asus_xbox_led_set_blocking;
+
+	ret = devm_led_classdev_register(&hdev->dev, &led->cdev);
+	if (ret) {
+		hid_err(hdev, "Failed to register Xbox logo LED: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * RC74XA defaults leave the Guide LED gated off after the power-on
+	 * flash. 0xff matches Armoury Crate / ally_module (zone bit mapping
+	 * of the logo is not isolated).
+	 */
+	asus_ally_write_led_power(drvdata, 0xff);
+	asus_xbox_led_apply(led);
+	drvdata->xbox_led = led;
+	hid_info(hdev, "Registered Xbox Guide LED: asus::xbox_logo\n");
+	return 0;
+}
+
 static int asus_aura_brightness_set_blocking(struct led_classdev *cdev,
 					     enum led_brightness brightness)
 {
@@ -2825,9 +3108,21 @@ static int asus_aura_brightness_set_blocking(struct led_classdev *cdev,
 	 * Firmware backlight only. Zone power belongs to enabled. brightness
 	 * 0 must not gate the zone: led_trigger_remove() calls this with
 	 * LED_OFF, and the persisted 0xb3 color stays in place.
+	 *
+	 * Ally MCU levels are 0-3 (same as asus::kbd_backlight). Writing the
+	 * sysfs 0-255 value straight into ba c5 c4 leaves the rings dark.
 	 */
-	if (ldev == &drvdata->dldev_kbd)
+	if (ldev == &drvdata->dldev_kbd) {
+		if (asus_is_ally(drvdata) && brightness > 3)
+			brightness = 3;
 		asus_kbd_set_brightness(drvdata->hdev, brightness);
+		/*
+		 * On Xbox Ally X, ring brightness 0 also extinguishes the
+		 * Guide LED. Re-apply its level when the rings leave 0.
+		 */
+		if (drvdata->xbox_led && brightness > 0)
+			asus_xbox_led_apply(drvdata->xbox_led);
+	}
 
 	return 0;
 }
@@ -2890,6 +3185,25 @@ static int asus_aura_sync_power(struct asus_drvdata *drvdata,
 	} else if (which == &drvdata->dldev_lightbar) {
 		drvdata->lb_power_on = enabled;
 		drvdata->lb_power_states = states;
+	}
+
+	/*
+	 * Ally ignores Aura 0xbd power. Feature 5a d1 09 gates the rings
+	 * (and the Xbox Guide LED on RC74XA).
+	 */
+	if (asus_is_ally(drvdata)) {
+		u8 flags = 0;
+
+		if (drvdata->kbd_power_on) {
+			flags = asus_ally_power_flags(drvdata->kbd_power_states);
+			/*
+			 * Xbox Guide LED zone bits are not in the low nibble;
+			 * 0xff is what lights it (Armoury Crate / ally_module).
+			 */
+			if (drvdata->xbox_led)
+				flags = 0xff;
+		}
+		return asus_ally_write_led_power(drvdata, flags);
 	}
 
 	if (drvdata->kbd_power_on)
@@ -3354,8 +3668,11 @@ static bool asus_aura_adopt_boot_effect(struct asus_drvdata *drvdata)
 	}
 
 	if (kbd && drvdata->kbd_effect_set) {
-		asus_lamparray_fill_solid(drvdata->kbd_direct_buf,
-					  ROG_STRIX_4ZONE_KBD_LEDS,
+		unsigned int n = drvdata->dldev_kbd.led_count;
+
+		if (!n || n > ROG_ALLY_MAX_KBD_LEDS)
+			n = ROG_STRIX_4ZONE_KBD_LEDS;
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf, n,
 					  drvdata->boot_r, drvdata->boot_g,
 					  drvdata->boot_b);
 		drvdata->kbd_direct_valid = true;
@@ -3415,9 +3732,17 @@ static int asus_init_dynamic_lighting(struct hid_device *hdev)
 			 effect_mask[0], effect_mask[1]);
 	}
 
-	kbd_n = asus_aura_fill_effects(drvdata->effects_kbd, mask, kbd_direct);
-	lightbar_n = asus_aura_fill_effects(drvdata->effects_lightbar, mask,
-					    lightbar_direct);
+	if (asus_is_ally(drvdata) && !mask) {
+		kbd_n = asus_aura_fill_ally_effects(drvdata->effects_kbd,
+						    kbd_direct);
+		lightbar_n = asus_aura_fill_ally_effects(drvdata->effects_lightbar,
+							 lightbar_direct);
+	} else {
+		kbd_n = asus_aura_fill_effects(drvdata->effects_kbd, mask,
+					       kbd_direct);
+		lightbar_n = asus_aura_fill_effects(drvdata->effects_lightbar,
+						    mask, lightbar_direct);
+	}
 
 	/* Keyboard Dynamic Lighting zone: always registered on Aura models. */
 	asus_aura_dldev_common_init(&drvdata->dldev_kbd, drvdata, "asus::keyboard",
@@ -3427,11 +3752,26 @@ static int asus_init_dynamic_lighting(struct hid_device *hdev)
 					    drvdata->kbd_palette);
 	drvdata->kbd_power_on = true;
 	drvdata->kbd_power_states = DL_POWER_STATE_ALL;
+	if (asus_is_ally(drvdata)) {
+		drvdata->dldev_kbd.cdev.max_brightness = 3;
+		drvdata->dldev_kbd.cdev.brightness = 3;
+	}
 	if (kbd_direct) {
 		drvdata->dldev_kbd.zone_type = drvdata->is_strix_4zone ?
 			"keyboard" : "keyboard_per_key";
-		drvdata->dldev_kbd.led_count = drvdata->is_strix_4zone ?
-			ROG_STRIX_4ZONE_KBD_LEDS : ROG_STRIX_DIRECT_LEDS;
+		if (asus_is_ally(drvdata) && drvdata->lamparray_count) {
+			unsigned int n = 0, i;
+
+			for (i = 0; i < drvdata->lamparray_count; i++) {
+				if (drvdata->lamparray_lamps[i].keyboard)
+					n++;
+			}
+			drvdata->dldev_kbd.led_count =
+				clamp_t(unsigned int, n, 1, ROG_ALLY_MAX_KBD_LEDS);
+		} else {
+			drvdata->dldev_kbd.led_count = drvdata->is_strix_4zone ?
+				ROG_STRIX_4ZONE_KBD_LEDS : ROG_STRIX_DIRECT_LEDS;
+		}
 	} else {
 		drvdata->dldev_kbd.zone_type = "keyboard";
 		if (drvdata->is_strix_4zone)
@@ -3478,6 +3818,16 @@ static int asus_init_dynamic_lighting(struct hid_device *hdev)
 
 	hid_info(hdev, "Registered dynamic lighting zones: kbd=%d, lightbar=%d\n",
 		 drvdata->has_dldev_kbd, drvdata->has_dldev_lightbar);
+
+	if (asus_is_ally(drvdata)) {
+		asus_kbd_set_brightness(hdev, 3);
+		asus_aura_sync_power(drvdata, &drvdata->dldev_kbd, true,
+				     DL_POWER_STATE_ALL);
+		ret = asus_init_xbox_led(hdev);
+		if (ret < 0)
+			hid_warn(hdev, "Failed to initialize Xbox Guide LED: %d\n",
+				 ret);
+	}
 
 	if (drvdata->boot_effect_valid &&
 	    (drvdata->kbd_effect_set || drvdata->lightbar_effect_set))
@@ -4376,6 +4726,8 @@ static int __maybe_unused asus_resume(struct hid_device *hdev)
 #if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
 	if (drvdata->has_dldev_kbd || drvdata->has_dldev_lightbar)
 		asus_aura_restore(drvdata);
+	if (drvdata->xbox_led)
+		asus_xbox_led_apply(drvdata->xbox_led);
 #endif
 
 	/*
@@ -4399,6 +4751,8 @@ static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 #if IS_REACHABLE(CONFIG_LEDS_CLASS_DYNAMIC)
 	if (drvdata->has_dldev_kbd || drvdata->has_dldev_lightbar)
 		asus_aura_restore(drvdata);
+	if (drvdata->xbox_led)
+		asus_xbox_led_apply(drvdata->xbox_led);
 #endif
 
 
