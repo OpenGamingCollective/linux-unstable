@@ -37,7 +37,9 @@ env:
 jobs:
   build:
     name: Build Fedora RPM packages
-    runs-on: ubuntu-latest
+    # Pin 24.04: sha512hmac (libkcapi) uses host AF_ALG; ubuntu-latest
+    # (26.04) fails with "Allocation of hmac(sha512) cipher failed".
+    runs-on: ubuntu-24.04
     timeout-minutes: 330
     container:
       image: docker.io/library/fedora:43
