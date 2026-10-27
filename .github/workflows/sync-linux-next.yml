@@ -56,6 +56,9 @@ jobs:
 
       - name: Configure upstream
         run: |
+          # Checkout runs as a different UID than the Arch container user, so
+          # git refuses the tree as "dubious ownership" unless we mark it safe.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git remote remove upstream || true
           git remote add upstream https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
           git fetch --no-tags upstream --prune
