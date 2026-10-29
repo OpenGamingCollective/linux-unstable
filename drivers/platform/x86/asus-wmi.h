@@ -42,6 +42,7 @@ struct quirk_entry {
 	bool wmi_ignore_fan;
 	bool filter_i8042_e1_extended_codes;
 	int key_wlan_event;
+	bool ignore_wlan_enable_event;
 	enum asus_wmi_tablet_switch_mode tablet_switch_mode;
 	int wapf;
 	/*
