@@ -1,0 +1,71 @@
+What:		/sys/class/leds/asus::keyboard/
+What:		/sys/class/leds/asus::lightbar/
+What:		/sys/class/leds/asus::logo/
+Date:		November 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	ASUS Aura keyboard, chassis lightbar, and lid-logo Dynamic
+		Lighting nodes. Each node accepts its own effect, palette, and
+		(where supported) direct RGB writes. Firmware effects, including
+		static color, are committed with Aura 0xb3/0xb5/0xb4 so the
+		controller keeps them across reboot. On asus::keyboard,
+		brightness is the firmware backlight dimmer and does not gate
+		the zone; enabled gates the zone with the power command.
+		asus::lightbar has no separate firmware dimmer: zone on/off is
+		``enabled`` only (brightness is not a meaningful intensity
+		control). asus::logo is registered when Aura discovery reports
+		a lid-logo region (probe byte 13 bit 0); it owns Aura zone 0x05
+		and independent logo power bits. Lid and rear-glow protocol
+		bytes follow the keyboard ``power_states`` bits (no dedicated
+		lid/rear LED nodes). Direct RGB may be backed by HID LampArray
+		(Usage Page 0x59) when Aura 0xBC cannot address the lightbar
+		independently. The lightbar and logo nodes are absent when the
+		device has no matching region.
+
+What:		/sys/class/leds/asus::slash/
+Date:		November 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	ASUS ROG Slash Dynamic Lighting node. ``effect`` /
+		``effect_index`` select Slash modes (Static, Bounce, …).
+		``speed`` maps the former Slash interval (0-5). ``enabled``
+		gates on/off via the Slash options packet; ``brightness`` is
+		the firmware intensity (0-255) and does not gate the bar.
+		``power_states`` supports boot/sleep/shutdown persistence
+		(protocol 0xd3 a0/a1/a4). Lid-closed and battery triggers are
+		not exposed through Dynamic Lighting power_states. On Aura
+		keyboards Slash uses feature report 0x5e. USB ID 0x193b is
+		shared with AniMe Matrix; the driver claims it for Slash only
+		when feature report 0x5e size and DMI board discrimination
+		select Slash rather than AniMe. The node is gated on
+		CONFIG_LEDS_CLASS_DYNAMIC.
+
+What:		/sys/class/leds/asus::anime/
+Date:		November 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	ASUS AniMe Matrix Dynamic Lighting node (USB 0x193b when
+		discriminated as AniMe). ``brightness`` is the firmware
+		display level (0-3). ``enabled`` maps to display on/off.
+		``effect`` selects ``direct`` streaming or programs one
+		per-power-state builtin slot. Builtin names are prefixed with
+		the slot (``boot_``, ``awake_``, ``sleep_``, ``shutdown_``);
+		writing one updates only that slot's firmware stage choice.
+		``power_states`` gates the firmware powersave-animation engine
+		for those slots without clearing the stored stage selection.
+		``direct_buffer`` accepts one intensity byte per LED;
+		``led_count`` matches the board layout (GA401, GA402, GU604,
+		G635L, G835L). Unknown AniMe boards use a GA402-like
+		three-pane layout.
+
+What:		/sys/class/leds/asus::xbox_logo/
+Date:		November 2026
+Contact:	Marco Scardovi <scardracs@disroot.org>
+Contact:	Denis Benato <denis.benato@linux.dev>
+Description:	Xbox Guide button LED on ROG Xbox Ally / Xbox Ally X
+		(``asus::xbox_logo``). Dynamic Lighting exposes ``effect`` /
+		``effect_index`` and ``speed`` via Ally MCU commands
+		d1 21 (effect+speed) and d1 20 (brightness 0-3). ``enabled``
+		gates the Guide LED without changing the last effect.
+		Present only on Ally devices that advertise Guide LED support
+		(or Xbox Ally DMI).
