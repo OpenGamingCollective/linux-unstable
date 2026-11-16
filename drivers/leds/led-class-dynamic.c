@@ -536,6 +536,14 @@ static ssize_t led_dynamic_stage_bin_write(struct led_classdev *cdev,
 			return -ENOMEM;
 	}
 
+	/*
+	 * Drop any trigger before taking ldev->lock. Trigger removal waits for
+	 * brightness workers via cancel_work_sync(); those workers take the
+	 * same lock (deadlock if we already hold it).
+	 */
+	if (end == size)
+		led_trigger_remove(cdev);
+
 	guard(mutex)(&cdev->led_access);
 	if (led_sysfs_is_disabled(cdev))
 		return -EBUSY;
@@ -559,7 +567,6 @@ static ssize_t led_dynamic_stage_bin_write(struct led_classdev *cdev,
 	if (end != size)
 		return count;
 
-	led_trigger_remove(cdev);
 	ret = commit(ldev, ldev->write_staging, size);
 	ldev->write_filled = 0;
 	if (ret < 0)
@@ -746,6 +753,7 @@ static void led_dynamic_release_resources(struct led_classdev_dynamic *ldev,
 	if (ldev->palette_allocated) {
 		kfree(ldev->palette);
 		ldev->palette = NULL;
+		ldev->num_palette_entries = 0;
 		ldev->palette_allocated = false;
 	}
 	kfree(ldev->write_staging);
@@ -835,6 +843,7 @@ int led_classdev_dynamic_register_ext(struct device *parent,
 		if (ret) {
 			cdev->led_dynamic = NULL;
 			cdev->flags &= ~LED_DYNAMIC_LIGHTING;
+			ldev->attached = false;
 			led_dynamic_release_resources(ldev, NULL);
 			return ret;
 		}
@@ -909,6 +918,7 @@ void led_classdev_dynamic_unregister(struct led_classdev_dynamic *ldev)
 	cdev = &ldev->cdev;
 	led_classdev_unregister(cdev);
 	cdev->led_dynamic = NULL;
+	cdev->flags &= ~LED_DYNAMIC_LIGHTING;
 	led_dynamic_release_resources(ldev, cdev);
 }
 EXPORT_SYMBOL_GPL(led_classdev_dynamic_unregister);
@@ -923,21 +933,35 @@ int devm_led_classdev_dynamic_register_ext(struct device *parent,
 					   struct led_init_data *init_data)
 {
 	struct led_classdev_dynamic **dr;
+	struct device *owner = parent;
 	int ret;
+
+	/*
+	 * Host attachment registers with parent=NULL, but devres still needs a
+	 * real device. Use the host LED's device as the managed-owner.
+	 */
+	if (ldev && ldev->host) {
+		if (!ldev->host->dev)
+			return -EINVAL;
+		owner = ldev->host->dev;
+	} else if (!parent) {
+		return -EINVAL;
+	}
 
 	dr = devres_alloc(devm_led_classdev_dynamic_release,
 			  sizeof(*dr), GFP_KERNEL);
 	if (!dr)
 		return -ENOMEM;
 
-	ret = led_classdev_dynamic_register_ext(parent, ldev, init_data);
+	ret = led_classdev_dynamic_register_ext(ldev && ldev->host ? NULL : parent,
+						ldev, init_data);
 	if (ret) {
 		devres_free(dr);
 		return ret;
 	}
 
 	*dr = ldev;
-	devres_add(parent, dr);
+	devres_add(owner, dr);
 
 	return 0;
 }
