@@ -217,13 +217,18 @@ enum asus_pid_193b_kind {
 /*
  * Microsoft HID Lighting Illumination / LampArray (Usage Page 0x59).
  *
- * Linux Dynamic Lighting (led-class-dynamic / asus::*) is the userspace ABI.
- * On some Strix N-KEY devices (e.g. G614PR) Aura feature 0xBC cannot address
- * the chassis lightbar independently; the sibling LampArray interface is the
- * correct direct-RGB backend (same path Windows DL / G-Helper LampArray use).
- * When LampArray is absent, callers fall back to Aura 0xBC. Firmware effects
- * (0xb3) remain on the Aura report ID 0x5d interface.
+ * Match Windows Dynamic Lighting / Armoury Crate / G-Helper ownership:
  *
+ * - Host RGB (effect "static" solid colour, and "direct" frames) uses the
+ *   sibling LampArray interface when present. Do not release LampArray only
+ *   to paint a solid colour.
+ * - Firmware animations (breathe, rainbow_*, pulse, …) use Aura 0xb3 on
+ *   report 0x5d after releasing LampArray; then re-push any sibling that
+ *   still has a cached host-RGB frame.
+ * - Without LampArray, host RGB falls back to Aura 0xBC; static without LA
+ *   uses 0xb3 like the firmware path.
+ *
+ * Linux Dynamic Lighting (led-class-dynamic / asus::*) is the userspace ABI.
  * The LampArray USB interface is bound without hidraw so lighting stays
  * exclusively under this driver.
  */
@@ -2714,20 +2719,166 @@ static int asus_aura_lightbar_set_direct(struct led_classdev_dynamic *ldev,
 }
 
 /*
- * Commit a firmware effect with the color stored in the palette. Brightness
- * and enabled do not scale or clear this packet: 0xb3 is what the controller
- * keeps across reboot, so it must stay the unscaled color.
+ * Cached host-RGB frame (LA-backed static or direct). Used after backlight /
+ * firmware handoff. Does not require ldev->enabled: set_enabled() updates that
+ * flag only after the callback returns.
  */
-static bool asus_aura_zone_wants_direct(struct asus_drvdata *drvdata,
+static bool asus_aura_zone_has_host_rgb(struct asus_drvdata *drvdata,
 					bool keyboard)
 {
 	struct led_classdev_dynamic *ldev = keyboard ? &drvdata->dldev_kbd :
 						      &drvdata->dldev_lightbar;
 	bool registered = keyboard ? drvdata->has_dldev_kbd :
 				     drvdata->has_dldev_lightbar;
+	bool valid = keyboard ? drvdata->kbd_direct_valid :
+				drvdata->lb_direct_valid;
 
-	return registered && ldev->enabled &&
-	       led_dynamic_effect_is(ldev, "direct");
+	return registered && valid &&
+	       (led_dynamic_effect_is(ldev, "direct") ||
+		led_dynamic_effect_is(ldev, "static"));
+}
+
+/* Sibling still showing host RGB and powered on — re-push after 0xb3. */
+static bool asus_aura_zone_wants_lamparray(struct asus_drvdata *drvdata,
+					   bool keyboard)
+{
+	struct led_classdev_dynamic *ldev = keyboard ? &drvdata->dldev_kbd :
+						      &drvdata->dldev_lightbar;
+
+	return asus_aura_zone_has_host_rgb(drvdata, keyboard) && ldev->enabled;
+}
+
+/* ba c5 c4 backlight can reset MCU colours — restore host-RGB frames. */
+static int asus_aura_repost_host_rgb_unlocked(struct asus_drvdata *drvdata)
+{
+	int ret;
+
+	asus_lamparray_try_init_unlocked(drvdata);
+
+	if (asus_aura_zone_has_host_rgb(drvdata, true) &&
+	    drvdata->dldev_kbd.enabled) {
+		ret = asus_aura_push_direct_unlocked(drvdata, true);
+		if (ret < 0)
+			return ret;
+	}
+	if (asus_aura_zone_has_host_rgb(drvdata, false) &&
+	    drvdata->dldev_lightbar.enabled) {
+		ret = asus_aura_push_direct_unlocked(drvdata, false);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+/* Fill one chassis zone buffer and push via LampArray (or 0xBC fallback). */
+static int asus_aura_commit_host_rgb_unlocked(struct asus_drvdata *drvdata,
+					      bool lightbar, u8 r, u8 g, u8 b)
+{
+	if (lightbar) {
+		asus_lamparray_fill_solid(drvdata->lb_direct_buf,
+					  asus_aura_lb_led_count(drvdata),
+					  r, g, b);
+		drvdata->lb_direct_valid = true;
+		return asus_aura_push_direct_unlocked(drvdata, false);
+	}
+
+	{
+		unsigned int n = drvdata->dldev_kbd.led_count;
+
+		if (!n || n > ROG_ALLY_MAX_KBD_LEDS)
+			n = ROG_STRIX_4ZONE_KBD_LEDS;
+		asus_lamparray_fill_solid(drvdata->kbd_direct_buf, n, r, g, b);
+		drvdata->kbd_direct_valid = true;
+		return asus_aura_push_direct_unlocked(drvdata, true);
+	}
+}
+
+static int asus_aura_restore_lamparray_siblings(struct asus_drvdata *drvdata,
+						bool lightbar, bool logo)
+{
+	int ret;
+
+	if (logo) {
+		if (asus_aura_zone_wants_lamparray(drvdata, true)) {
+			ret = asus_aura_push_direct_unlocked(drvdata, true);
+			if (ret < 0)
+				return ret;
+		}
+		if (asus_aura_zone_wants_lamparray(drvdata, false)) {
+			ret = asus_aura_push_direct_unlocked(drvdata, false);
+			if (ret < 0)
+				return ret;
+		}
+		return 0;
+	}
+
+	/* Refresh the sibling of the zone that just took firmware control. */
+	if (asus_aura_zone_wants_lamparray(drvdata, lightbar))
+		return asus_aura_push_direct_unlocked(drvdata, lightbar);
+
+	return 0;
+}
+
+static int asus_aura_commit_firmware(struct asus_drvdata *drvdata,
+				     struct led_classdev_dynamic *ldev,
+				     bool lightbar, bool logo, u8 aura_mode,
+				     u8 r, u8 g, u8 b, u8 r2, u8 g2, u8 b2,
+				     unsigned int speed,
+				     enum dl_direction direction)
+{
+	u8 hw_speed = asus_aura_speed_to_hw(speed);
+	u8 hw_dir = asus_aura_direction_to_hw(direction);
+	int ret;
+
+	/*
+	 * Firmware animations need the MCU Aura engine. Release LampArray
+	 * first (Windows does the same handoff), program 0xb3, then restore
+	 * any sibling that still has a host-RGB frame.
+	 */
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		asus_lamparray_try_init_unlocked(drvdata);
+		if (drvdata->lamparray_count)
+			asus_lamparray_release_unlocked(drvdata);
+	}
+
+	if (logo)
+		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_LOGO,
+						  aura_mode, r, g, b, hw_speed,
+						  hw_dir, r2, g2, b2, true);
+	else if (lightbar)
+		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_BAR_LEFT,
+						 AURA_ZONE_BAR_RIGHT, aura_mode,
+						 r, g, b, hw_speed, hw_dir,
+						 r2, g2, b2);
+	else if (asus_is_ally(drvdata))
+		/*
+		 * Ally X / Xbox Ally X: zone 0 addresses both rings. Zones
+		 * 1-4 are only the left ring on Xbox Ally X.
+		 */
+		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL,
+						  aura_mode, r, g, b, hw_speed,
+						  hw_dir, r2, g2, b2, true);
+	else if (drvdata->is_strix_4zone)
+		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_KEY1,
+						 AURA_ZONE_KEY4, aura_mode,
+						 r, g, b, hw_speed, hw_dir,
+						 r2, g2, b2);
+	else
+		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL,
+						  aura_mode, r, g, b, hw_speed,
+						  hw_dir, r2, g2, b2, true);
+	if (ret < 0)
+		return ret;
+
+	scoped_guard(mutex, &drvdata->aura_lock) {
+		ret = asus_aura_restore_lamparray_siblings(drvdata, lightbar,
+							  logo);
+		if (ret < 0)
+			return ret;
+	}
+
+	asus_aura_mark_effect_set(drvdata, ldev);
+	return 0;
 }
 
 static int asus_aura_commit_effect(struct led_classdev_dynamic *ldev,
@@ -2768,87 +2919,29 @@ static int asus_aura_commit_effect(struct led_classdev_dynamic *ldev,
 	}
 
 	/*
-	 * Static and animations are firmware effects: commit them with 0xb3
-	 * so the controller keeps the color across reboot. LampArray stays
-	 * the direct-RGB backend and must be released first. Re-apply the
-	 * sibling zone afterwards if it is still in host direct mode.
+	 * Host RGB / static: prefer LampArray when present (do not release).
+	 * Logo has no LampArray lamps — always firmware below. "direct" is
+	 * handled above.
 	 */
-	scoped_guard(mutex, &drvdata->aura_lock) {
+	if (!logo && name && !strcmp(name, "static")) {
+		guard(mutex)(&drvdata->aura_lock);
+
 		asus_lamparray_try_init_unlocked(drvdata);
-		if (drvdata->lamparray_count)
-			asus_lamparray_release_unlocked(drvdata);
-	}
-
-	if (logo)
-		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_LOGO,
-						  aura_mode, r, g, b,
-						  asus_aura_speed_to_hw(speed),
-						  asus_aura_direction_to_hw(direction),
-						  r2, g2, b2, true);
-	else if (lightbar)
-		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_BAR_LEFT,
-						 AURA_ZONE_BAR_RIGHT, aura_mode,
-						 r, g, b,
-						 asus_aura_speed_to_hw(speed),
-						 asus_aura_direction_to_hw(direction),
-						 r2, g2, b2);
-	else if (asus_is_ally(drvdata))
-		/*
-		 * Ally X and Xbox Ally X share PID 0x1b4c. Discovery still
-		 * reports 4-zone (byte 9 = 0x02), but zones 1-4 are only the
-		 * left ring on Xbox Ally X. Zone 0 addresses both rings on
-		 * both MCUs (Armoury Crate and the out-of-tree Ally driver).
-		 */
-		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL,
-						  aura_mode, r, g, b,
-						  asus_aura_speed_to_hw(speed),
-						  asus_aura_direction_to_hw(direction),
-						  r2, g2, b2, true);
-	else if (drvdata->is_strix_4zone)
-		ret = asus_aura_write_zone_range(drvdata, AURA_ZONE_KEY1,
-						 AURA_ZONE_KEY4, aura_mode,
-						 r, g, b,
-						 asus_aura_speed_to_hw(speed),
-						 asus_aura_direction_to_hw(direction),
-						 r2, g2, b2);
-	else
-		ret = asus_aura_write_zone_effect(drvdata, AURA_ZONE_ALL,
-						  aura_mode, r, g, b,
-						  asus_aura_speed_to_hw(speed),
-						  asus_aura_direction_to_hw(direction),
-						  r2, g2, b2, true);
-	if (ret < 0)
-		return ret;
-
-	/*
-	 * Release above drops LampArray for every zone. If a sibling is still
-	 * in direct mode, push its cached frame again so host control is not
-	 * lost when this zone switches to a firmware effect. Logo is neither
-	 * keyboard nor lightbar, so refresh both direct siblings.
-	 */
-	scoped_guard(mutex, &drvdata->aura_lock) {
-		if (logo) {
-			if (asus_aura_zone_wants_direct(drvdata, true)) {
-				ret = asus_aura_push_direct_unlocked(drvdata,
-								     true);
-				if (ret < 0)
-					return ret;
-			}
-			if (asus_aura_zone_wants_direct(drvdata, false)) {
-				ret = asus_aura_push_direct_unlocked(drvdata,
-								     false);
-				if (ret < 0)
-					return ret;
-			}
-		} else if (asus_aura_zone_wants_direct(drvdata, lightbar)) {
-			ret = asus_aura_push_direct_unlocked(drvdata, lightbar);
+		if (drvdata->lamparray_count) {
+			ret = asus_aura_commit_host_rgb_unlocked(drvdata,
+								 lightbar,
+								 r, g, b);
 			if (ret < 0)
 				return ret;
+			asus_aura_mark_effect_set(drvdata, ldev);
+			return 0;
 		}
+		/* No LampArray: fall through to Aura 0xb3 static. */
 	}
 
-	asus_aura_mark_effect_set(drvdata, ldev);
-	return 0;
+	return asus_aura_commit_firmware(drvdata, ldev, lightbar, logo,
+					 aura_mode, r, g, b, r2, g2, b2,
+					 speed, direction);
 }
 
 static int asus_aura_apply_effect(struct led_classdev_dynamic *ldev)
@@ -2996,10 +3089,32 @@ static int asus_aura_set_enabled(struct led_classdev_dynamic *ldev, bool enabled
 			if (ret < 0)
 				return ret;
 
-			if (!asus_aura_zone_wants_direct(drvdata, lightbar))
+			if (!asus_aura_zone_has_host_rgb(drvdata, lightbar))
 				asus_lamparray_release_unlocked(drvdata);
 		}
 		return 0;
+	}
+
+	/*
+	 * Power on:
+	 * - direct: re-push the per-LED cache (palette is not the source).
+	 * - static: re-commit from effects_palette via apply_effect so a
+	 *   stale KeyN cache cannot outrank the colour userspace last wrote.
+	 * - animations: firmware 0xb3 via apply_effect.
+	 * ldev->enabled is still false here; commit_effect does not gate on it.
+	 */
+	if (!logo && led_dynamic_effect_is(ldev, "direct")) {
+		bool keyboard = !lightbar;
+
+		guard(mutex)(&drvdata->aura_lock);
+
+		asus_lamparray_try_init_unlocked(drvdata);
+		if (asus_aura_zone_has_host_rgb(drvdata, keyboard)) {
+			ret = asus_aura_push_direct_unlocked(drvdata, keyboard);
+			if (ret < 0)
+				return ret;
+			return 0;
+		}
 	}
 
 	return asus_aura_apply_effect(ldev);
@@ -3361,6 +3476,14 @@ static int asus_aura_brightness_set_blocking(struct led_classdev *cdev,
 		 */
 		if (drvdata->xbox_led && brightness > 0)
 			asus_xbox_led_apply(drvdata->xbox_led);
+
+		/*
+		 * Backlight report ba c5 c4 can leave the MCU on a default
+		 * solid red across zones. Re-push LampArray host-RGB frames
+		 * (Windows keeps LA in control across dimmer changes).
+		 */
+		guard(mutex)(&drvdata->aura_lock);
+		asus_aura_repost_host_rgb_unlocked(drvdata);
 	}
 
 	return 0;

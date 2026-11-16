@@ -6,21 +6,26 @@ Contact:	Marco Scardovi <scardracs@disroot.org>
 Contact:	Denis Benato <denis.benato@linux.dev>
 Description:	ASUS Aura keyboard, chassis lightbar, and lid-logo Dynamic
 		Lighting nodes. Each node accepts its own effect, palette, and
-		(where supported) direct RGB writes. Firmware effects, including
-		static color, are committed with Aura 0xb3/0xb5/0xb4 so the
-		controller keeps them across reboot. On asus::keyboard,
-		brightness is the firmware backlight dimmer and does not gate
-		the zone; enabled gates the zone with the power command.
-		asus::lightbar has no separate firmware dimmer: zone on/off is
-		``enabled`` only (brightness is not a meaningful intensity
-		control). asus::logo is registered when Aura discovery reports
-		a lid-logo region (probe byte 13 bit 0); it owns Aura zone 0x05
-		and independent logo power bits. Lid and rear-glow protocol
-		bytes follow the keyboard ``power_states`` bits (no dedicated
-		lid/rear LED nodes). Direct RGB may be backed by HID LampArray
-		(Usage Page 0x59) when Aura 0xBC cannot address the lightbar
-		independently. The lightbar and logo nodes are absent when the
-		device has no matching region.
+		(where supported) direct RGB writes.
+
+		Ownership matches Windows Dynamic Lighting / Armoury Crate:
+		when a HID LampArray sibling (Usage Page 0x59) is present,
+		``static`` and ``direct`` are host RGB on that interface and
+		do not release LampArray. Firmware animations (breathe,
+		rainbow_*, pulse, …) use Aura 0xb3/0xb5/0xb4 after releasing
+		LampArray; sibling host-RGB frames are re-pushed afterwards.
+		Without LampArray, ``static`` uses Aura 0xb3 and ``direct``
+		falls back to Aura 0xBC.
+
+		On asus::keyboard, brightness is the firmware backlight dimmer
+		and does not gate the zone; enabled gates the zone with the
+		power command. asus::lightbar has no separate firmware dimmer:
+		zone on/off is ``enabled`` only. asus::logo is registered when
+		Aura discovery reports a lid-logo region (probe byte 13 bit 0);
+		it owns Aura zone 0x05 and has no LampArray path. Lid and
+		rear-glow protocol bytes follow the keyboard ``power_states``
+		bits. The lightbar and logo nodes are absent when the device
+		has no matching region.
 
 What:		/sys/class/leds/asus::slash/
 Date:		November 2026
